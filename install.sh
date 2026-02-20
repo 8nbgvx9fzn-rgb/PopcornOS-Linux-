@@ -1,13 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-DISK="/dev/nvme0n1"   # <-- set this correctly (whole disk, not a partition)
-HOSTNAME="embedded"
+DISK="/dev/nvme0n1"   # whole disk
+ESP_SIZE="+512M"
 
 echo "==> Safety checks"
 [[ -b "$DISK" ]] || { echo "ERROR: $DISK is not a block device"; exit 1; }
-
-# Refuse to run if DISK looks like a partition
 if [[ "$DISK" =~ p[0-9]+$ ]] || [[ "$DISK" =~ [0-9]+$ && "$DISK" == /dev/sd* ]]; then
   echo "ERROR: DISK must be the whole disk (e.g. /dev/nvme0n1 or /dev/sda), not a partition"
   exit 1
@@ -17,126 +15,111 @@ echo "==> Unmounting anything at /mnt"
 swapoff -a || true
 umount -R /mnt 2>/dev/null || true
 
-echo "==> Partitioning disk (GPT: EFI + root)"
+echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"
-sgdisk -n 2:0:0     -t 2:8300 "$DISK"
+sgdisk -n 1:0:${ESP_SIZE} -t 1:ef00 "$DISK"
 
 sync
 partprobe "$DISK" || true
 udevadm settle
 
-# NVMe partitions are p1/p2; SATA/SCSI disks are 1/2
 if [[ "$DISK" == /dev/nvme* ]]; then
   EFI="${DISK}p1"
-  ROOT="${DISK}p2"
 else
   EFI="${DISK}1"
-  ROOT="${DISK}2"
 fi
 
-echo "==> Waiting for partitions to appear: $EFI and $ROOT"
-for i in {1..20}; do
-  [[ -b "$EFI" && -b "$ROOT" ]] && break
+echo "==> Waiting for partition to appear: $EFI"
+for i in {1..40}; do
+  [[ -b "$EFI" ]] && break
   sleep 0.2
   udevadm settle
 done
-[[ -b "$EFI" && -b "$ROOT" ]] || { echo "ERROR: partitions not found"; lsblk; exit 1; }
+[[ -b "$EFI" ]] || { echo "ERROR: EFI partition not found"; lsblk; exit 1; }
 
-echo "==> Creating filesystems"
+echo "==> Creating filesystem (FAT32 ESP)"
 mkfs.fat -F32 "$EFI"
-mkfs.ext4 -F "$ROOT"
 
-echo "==> Mounting target"
-mount "$ROOT" /mnt
-mkdir -p /mnt/boot
-mount "$EFI" /mnt/boot
+echo "==> Mounting ESP at /mnt/efi"
+mkdir -p /mnt/efi
+mount "$EFI" /mnt/efi
 
-echo "==> Installing base system"
-pacstrap -K /mnt linux linux-firmware systemd
+# We'll build a tiny Arch userspace in tmpfs just long enough to create vmlinuz+initramfs
+echo "==> Creating tmpfs staging root at /mnt/root"
+mkdir -p /mnt/root
+mount -t tmpfs -o size=2G tmpfs /mnt/root
 
-echo "==> Generating fstab"
-genfstab -U /mnt >> /mnt/etc/fstab
+echo "==> Installing only what we need into staging root"
+# linux => kernel + mkinitcpio presets
+# busybox => shell inside initramfs
+pacstrap -K /mnt/root linux busybox
 
-echo "==> Capturing ROOT PARTUUID"
-ROOT_PARTUUID="$(blkid -s PARTUUID -o value "$ROOT")"
-[[ -n "$ROOT_PARTUUID" ]] || { echo "ERROR: could not read PARTUUID for $ROOT"; exit 1; }
-echo "    ROOT_PARTUUID=$ROOT_PARTUUID"
-
-echo "==> Configuring system in chroot"
-arch-chroot /mnt /bin/bash -e <<EOF
+echo "==> Building initramfs that boots directly to a BusyBox shell"
+arch-chroot /mnt/root /bin/bash -e <<'EOF'
 set -euo pipefail
 
-echo "$HOSTNAME" > /etc/hostname
+# Minimal init that mounts basic pseudo-filesystems, then drops to a shell.
+cat > /init <<'INIT'
+#!/bin/sh
+mount -t proc  proc /proc
+mount -t sysfs sys  /sys
+mount -t devtmpfs dev /dev 2>/dev/null || true
+echo
+echo "Tiny Linux: initramfs BusyBox shell"
+exec /usr/bin/busybox sh
+INIT
+chmod +x /init
 
-ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-hwclock --systohc || true
+# Minimal mkinitcpio config:
+# - include /init and busybox binary in the initramfs
+# - keep only essential hooks so the initramfs can run and you have a working console/keyboard
+cat > /etc/mkinitcpio.conf <<'MK'
+MODULES=()
+BINARIES=(/usr/bin/busybox)
+FILES=(/init)
+HOOKS=(base udev autodetect modconf keyboard keymap consolefont)
+COMPRESSION="zstd"
+MK
 
-# Ensure root is usable in emergencies (no password, unlocked).
-# For a closed ecosystem, this is fine; otherwise set a password instead.
-passwd -d root || true
-passwd -u root || true
+# Generate initramfs (creates /boot/initramfs-linux.img) using our config
+mkinitcpio -c /etc/mkinitcpio.conf -g /boot/initramfs-linux.img
+EOF
 
-# Install systemd-boot
-bootctl install
+echo "==> Installing systemd-boot to the ESP"
+# bootctl is available on the Arch ISO environment; install directly to the mounted ESP
+bootctl --esp-path=/mnt/efi install
 
-cat > /boot/loader/loader.conf <<LOADER
-default arch
+echo "==> Copying kernel + initramfs to the ESP (only persistent artifacts)"
+# Put kernel/initramfs in the ESP root for simple systemd-boot entries
+cp -f /mnt/root/boot/vmlinuz-linux /mnt/efi/vmlinuz-linux
+cp -f /mnt/root/boot/initramfs-linux.img /mnt/efi/initramfs-linux.img
+
+echo "==> Writing systemd-boot loader entry (no root=..., boots initramfs shell)"
+mkdir -p /mnt/efi/loader/entries
+
+cat > /mnt/efi/loader/loader.conf <<'LOADER'
+default tiny
 timeout 0
 editor no
 LOADER
 
-cat > /boot/loader/entries/arch.conf <<ENTRY
-title   Embedded Linux
+cat > /mnt/efi/loader/entries/tiny.conf <<'ENTRY'
+title   Tiny initramfs shell
 linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
-options root=PARTUUID=$ROOT_PARTUUID rw quiet loglevel=3
+options rdinit=/init quiet loglevel=3
 ENTRY
 
-# Success indicator on tty2 so tty1 remains a console
-cat > /usr/local/bin/success.sh <<'SCRIPT'
-#!/bin/sh
-clear
-printf "\033[42m\033[30m"
-printf "\n\n   INSTALL SUCCESSFUL   \n\n"
-printf "   KERNEL BOOTED OK     \n\n"
-printf "   (tty1 is console)    \n\n"
-printf "\033[0m"
-sleep infinity
-SCRIPT
-chmod +x /usr/local/bin/success.sh
+echo "==> Verification"
+echo "--- loader entry ---"
+cat /mnt/efi/loader/entries/tiny.conf
+echo "--- ESP contents ---"
+ls -lah /mnt/efi | sed -n '1,200p'
 
-cat > /etc/systemd/system/success@tty2.service <<SERVICE
-[Unit]
-Description=Visual success indicator (tty2)
-After=multi-user.target
-
-[Service]
-ExecStart=/usr/local/bin/success.sh
-StandardInput=tty
-StandardOutput=tty
-TTYPath=/dev/tty2
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-systemctl enable success@tty2.service
-
-# Keep getty on tty1 so you can always recover locally
-systemctl enable getty@tty1.service
-
-EOF
-
-echo "==> Post-install verification"
-echo "Boot entry written as:"
-cat /mnt/boot/loader/entries/arch.conf
+echo "==> Cleanup"
+umount -R /mnt/root
+umount -R /mnt/efi
 
 echo
-echo "==> Verifying that PARTUUID exists on target disk"
-blkid | grep -F "$ROOT_PARTUUID" || { echo "ERROR: PARTUUID not found in blkid output"; blkid; exit 1; }
-
-echo
-echo "==> Install complete. Rebooting in 5 seconds."
-sleep 5
+echo "==> Done. Reboot to get a BusyBox shell with no users, no services, no root filesystem."
 reboot
