@@ -42,9 +42,8 @@ echo "==> Formatting + mounting EFI (FAT32)"
 mkfs.fat -F32 -n EFI "$EFI"
 mount "$EFI" /mnt
 
-# Keep these for debugging/inspection (optional)
+# Optional debug directory
 mkdir -p /mnt/EFI/Linux
-
 # We'll use a temporary staging root to install packages needed to build the UKI.
 STAGE="/tmp/stage"
 rm -rf "$STAGE"
@@ -55,15 +54,12 @@ echo "==> Building ultra-minimal initramfs (busybox + libs + /init)"
 INITRAMFS_DIR="/tmp/initramfs.$$"
 rm -rf "$INITRAMFS_DIR"
 mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,root}
-
 # Copy busybox
 cp -a "$STAGE/usr/bin/busybox" "$INITRAMFS_DIR/bin/busybox"
-
 # Create applet symlinks we care about (add more if you want)
 for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep; do
   ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
 done
-
 # Minimal /init: mount pseudo-filesystems and drop to shell
 cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
@@ -80,7 +76,6 @@ echo
 exec /bin/sh
 INIT
 chmod +x "$INITRAMFS_DIR/init"
-
 # Copy dynamic linker + libs needed by busybox (Arch busybox is usually dynamic)
 echo "==> Copying shared libs for busybox"
 mapfile -t libs < <(ldd "$STAGE/usr/bin/busybox" | awk '
@@ -94,7 +89,6 @@ for f in "${libs[@]}"; do
   mkdir -p "$(dirname "$dest")"
   cp -a "$f" "$dest"
 done
-
 # Also copy the dynamic loader explicitly if ldd didn’t list it plainly
 for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.*; do
   if [[ -f "$loader" ]]; then
@@ -111,21 +105,26 @@ echo "==> Creating initramfs image"
 
 echo "==> Copying kernel (for reference) + building UKI at UEFI fallback path"
 cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
-
 # Build a Unified Kernel Image (UKI) using systemd's EFI stub + objcopy.
-# This avoids boot managers and (critically) avoids creating UEFI NVRAM boot entries.
 STUB="$STAGE/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-OBJCOPY="$STAGE/usr/bin/objcopy"
 
 [[ -f "$STUB" ]] || { echo "ERROR: systemd EFI stub not found at $STUB"; exit 1; }
-[[ -x "$OBJCOPY" ]] || { echo "ERROR: objcopy not found at $OBJCOPY"; exit 1; }
+# Prefer host objcopy if present; otherwise use staged objcopy with staged libraries.
+if command -v objcopy >/dev/null 2>&1; then
+  OBJCOPY_BIN="$(command -v objcopy)"
+  OBJCOPY_ENV=()
+else
+  OBJCOPY_BIN="$STAGE/usr/bin/objcopy"
+  [[ -x "$OBJCOPY_BIN" ]] || { echo "ERROR: objcopy not found (install binutils in live env, or check pacstrap)"; exit 1; }
+  # Critical fix for: "error while loading shared libraries: libbfd-*.so: cannot open shared object file"
+  # Run staged objcopy with staged library search path.
+  OBJCOPY_ENV=(env "LD_LIBRARY_PATH=$STAGE/usr/lib:$STAGE/usr/lib64")
+fi
 
 CMDLINE_FILE="/tmp/cmdline.$$"
 OSREL_FILE="/tmp/os-release.$$"
-
 # Kernel command line (no root= needed; initramfs drops to shell)
 echo "quiet loglevel=3" > "$CMDLINE_FILE"
-
 # Minimal os-release metadata (optional but common in UKIs)
 cat > "$OSREL_FILE" <<EOF
 NAME="$LABEL"
@@ -136,8 +135,7 @@ EOF
 mkdir -p /mnt/EFI/BOOT
 
 # UKI section layout values are conventional; they just need to not overlap.
-# These values are commonly used with systemd's EFI stub.
-"$OBJCOPY" \
+"${OBJCOPY_ENV[@]}" "$OBJCOPY_BIN" \
   --add-section .osrel="$OSREL_FILE"     --change-section-vma .osrel=0x20000 \
   --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x30000 \
   --add-section .linux="$STAGE/boot/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
