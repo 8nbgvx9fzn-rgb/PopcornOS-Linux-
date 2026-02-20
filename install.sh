@@ -1,44 +1,27 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-DISK="${DISK:-/dev/nvme0n1}"    # set DISK=/dev/sdX when running
-LABEL="${LABEL:-MINISHELL}"
-ALPINE_BRANCH="${ALPINE_BRANCH:-v3.22}"   # stable branch; can use v3.23 etc.
-ALPINE_REPO="${ALPINE_REPO:-main}"
-ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
+DISK="/dev/nvme0n1"   # whole disk
+LABEL="MINISHELL"
 
-# --- Requirements on the live environment ---
-need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing '$1'"; exit 1; }; }
-need sgdisk
-need mkfs.fat
-need efibootmgr
-need tar
-need gzip
-need cpio
-need awk
-need sed
-need curl
+echo "==> Safety checks"
+[[ -b "$DISK" ]] || { echo "ERROR: $DISK is not a block device"; exit 1; }
+if [[ "$DISK" =~ p[0-9]+$ ]] || [[ "$DISK" =~ [0-9]+$ && "$DISK" == /dev/sd* ]]; then
+  echo "ERROR: DISK must be a whole disk (e.g. /dev/nvme0n1 or /dev/sda), not a partition"
+  exit 1
+fi
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64) ALPINE_ARCH="x86_64" ;;
-  aarch64) ALPINE_ARCH="aarch64" ;;
-  *) echo "ERROR: unsupported arch '$ARCH'"; exit 1 ;;
-esac
-
-BASE_URL="${ALPINE_MIRROR}/${ALPINE_BRANCH}/${ALPINE_REPO}/${ALPINE_ARCH}"
-
-echo "==> Using Alpine repo: ${BASE_URL}"
-echo "==> Target disk: ${DISK}"
-
+echo "==> Unmounting /mnt"
+swapoff -a || true
 umount -R /mnt 2>/dev/null || true
 
 echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 1:0:+1024M -t 1:ef00 -c 1:"EFI" "$DISK"
+
 sync
 partprobe "$DISK" || true
-udevadm settle 2>/dev/null || true
+udevadm settle
 
 if [[ "$DISK" == /dev/nvme* ]]; then
   EFI="${DISK}p1"
@@ -46,109 +29,112 @@ else
   EFI="${DISK}1"
 fi
 
-echo "==> Formatting EFI partition"
-mkfs.fat -F32 "$EFI"
+echo "==> Waiting for EFI partition: $EFI"
+for i in {1..20}; do
+  [[ -b "$EFI" ]] && break
+  sleep 0.2
+  udevadm settle
+done
+[[ -b "$EFI" ]] || { echo "ERROR: partition not found"; lsblk; exit 1; }
 
-echo "==> Mounting EFI"
-mkdir -p /mnt
+echo "==> Formatting + mounting EFI (FAT32)"
+mkfs.fat -F32 -n EFI "$EFI"
 mount "$EFI" /mnt
 mkdir -p /mnt/EFI/Linux
+mkdir -p /mnt/loader/entries
 
-WORK="$(mktemp -d)"
-cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT
+# We'll use a temporary staging root to install packages and build initramfs.
+STAGE="/mnt/stage"
+mkdir -p "$STAGE"
 
-echo "==> Downloading APKINDEX to resolve latest package filenames"
-curl -fsSL "${BASE_URL}/APKINDEX.tar.gz" -o "$WORK/APKINDEX.tar.gz"
-tar -xzf "$WORK/APKINDEX.tar.gz" -C "$WORK"
-APKINDEX="$WORK/APKINDEX"
+echo "==> Installing minimal build inputs into staging root (linux + busybox)"
+# mkinitcpio is NOT required in this approach; we build initramfs manually.
+pacstrap -K "$STAGE" linux busybox
 
-pkg_ver() {
-  # Extract version for a package name from an APKINDEX file.
-  # Records are separated by blank lines. We find record where P:<name> then read V:<ver>.
-  local index_file="$1"
-  local pkg="$2"
-  awk -v pkg="$pkg" '
-    BEGIN{RS=""; FS="\n"}
-    {
-      p=""; v=""
-      for (i=1; i<=NF; i++) {
-        if ($i ~ /^P:/) p=substr($i,3)
-        else if ($i ~ /^V:/) v=substr($i,3)
-      }
-      if (p==pkg) { print v; exit }
-    }
-  ' "$index_file"
-}
+echo "==> Building ultra-minimal initramfs (busybox + libs + /init)"
+INITRAMFS_DIR="/tmp/initramfs.$$"
+rm -rf "$INITRAMFS_DIR"
+mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,root}
 
-VMLINUX_PKG="linux-virt"
-BUSYBOX_PKG="busybox-static"
+# Copy busybox
+cp -a "$STAGE/usr/bin/busybox" "$INITRAMFS_DIR/bin/busybox"
 
-VMLINUX_VER="$(pkg_ver "$VMLINUX_PKG")"
-BUSYBOX_VER="$(pkg_ver "$BUSYBOX_PKG")"
+# Create applet symlinks we care about (add more if you want)
+for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep; do
+  ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
+done
 
-[[ -n "$VMLINUX_VER" ]] || { echo "ERROR: could not find $VMLINUX_PKG in APKINDEX"; exit 1; }
-[[ -n "$BUSYBOX_VER" ]] || { echo "ERROR: could not find $BUSYBOX_PKG in APKINDEX"; exit 1; }
-
-VMLINUX_APK="${VMLINUX_PKG}-${VMLINUX_VER}.apk"
-BUSYBOX_APK="${BUSYBOX_PKG}-${BUSYBOX_VER}.apk"
-
-echo "==> Resolved:"
-echo "    ${VMLINUX_APK}"
-echo "    ${BUSYBOX_APK}"
-
-echo "==> Downloading packages"
-curl -fsSL "${BASE_URL}/${VMLINUX_APK}" -o "$WORK/${VMLINUX_APK}"
-curl -fsSL "${BASE_URL}/${BUSYBOX_APK}" -o "$WORK/${BUSYBOX_APK}"
-
-echo "==> Extracting kernel package"
-mkdir -p "$WORK/kpkg"
-tar -xzf "$WORK/${VMLINUX_APK}" -C "$WORK/kpkg"
-
-VMLINUX_SRC="$(find "$WORK/kpkg" -maxdepth 2 -type f -name 'vmlinuz-*' | head -n 1)"
-[[ -n "${VMLINUX_SRC:-}" ]] || { echo "ERROR: couldn't find vmlinuz-* inside ${VMLINUX_APK}"; exit 1; }
-
-echo "==> Copying kernel to EFI"
-cp -f "$VMLINUX_SRC" /mnt/EFI/Linux/vmlinuz.efi
-
-echo "==> Extracting busybox-static"
-mkdir -p "$WORK/bbpkg"
-tar -xzf "$WORK/${BUSYBOX_APK}" -C "$WORK/bbpkg"
-
-# Busybox binary location can vary; pick the first executable named busybox*
-BUSYBOX_BIN="$(find "$WORK/bbpkg" -type f -name 'busybox*' -perm -111 | head -n 1)"
-[[ -n "${BUSYBOX_BIN:-}" ]] || { echo "ERROR: couldn't find busybox binary in ${BUSYBOX_APK}"; exit 1; }
-
-echo "==> Building tiny initramfs (busybox + /init)"
-INITRD="$WORK/initrd"
-mkdir -p "$INITRD"/{bin,proc,sys,dev}
-cp -f "$BUSYBOX_BIN" "$INITRD/bin/busybox"
-chmod +x "$INITRD/bin/busybox"
-
-cat > "$INITRD/init" <<'INIT'
-#!/bin/busybox sh
-/bin/busybox --install -s
-
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev || mkdir -p /dev
+# Minimal /init: mount pseudo-filesystems and drop to shell
+cat > "$INITRAMFS_DIR/init" <<'INIT'
+#!/bin/sh
+mount -t proc  proc  /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
 echo
-echo "Minimal Linux booted (initramfs only)."
-exec sh
+echo "=== minishell initramfs ==="
+echo "Kernel: $(uname -a)"
+echo "Dropping to /bin/sh..."
+echo
+
+exec /bin/sh
 INIT
-chmod +x "$INITRD/init"
+chmod +x "$INITRAMFS_DIR/init"
 
-( cd "$INITRD" && find . -print0 | cpio --null -ov --format=newc ) | gzip -9 > /mnt/EFI/Linux/initramfs.img
+# Copy dynamic linker + libs needed by busybox (Arch busybox is usually dynamic)
+# This is the part that makes the initramfs actually boot reliably.
+echo "==> Copying shared libs for busybox"
+mapfile -t libs < <(ldd "$STAGE/usr/bin/busybox" | awk '
+  $2 == "=>" { print $3 }
+  $1 ~ /^\// { print $1 }
+' | sort -u)
 
-sync
+for f in "${libs[@]}"; do
+  [[ -f "$f" ]] || continue
+  # Preserve lib64 vs lib layout
+  dest="$INITRAMFS_DIR${f}"
+  mkdir -p "$(dirname "$dest")"
+  cp -a "$f" "$dest"
+done
 
-echo "==> Creating UEFI boot entry (EFI stub kernel)"
-efibootmgr -c \
-  -d "$DISK" -p 1 \
-  -L "$LABEL" \
-  -l '\EFI\Linux\vmlinuz.efi' \
-  -u "initrd=\EFI\Linux\initramfs.img rdinit=/init quiet"
+# Also copy the dynamic loader explicitly if ldd didn’t list it plainly
+# (common paths: /lib64/ld-linux-x86-64.so.2, /lib/ld-linux-*.so.*)
+for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.*; do
+  if [[ -f "$loader" ]]; then
+    mkdir -p "$INITRAMFS_DIR$(dirname "$loader")"
+    cp -a "$loader" "$INITRAMFS_DIR$loader"
+  fi
+done
+
+echo "==> Copying kernel + building initramfs image"
+# Kernel image from staging (Arch installs it in /boot within the staged root)
+cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
+
+# Create initramfs cpio (gzip for compatibility; you can use xz if you want)
+(
+  cd "$INITRAMFS_DIR"
+  find . -print0 | cpio --null -ov --format=newc
+) | gzip -9 > /mnt/EFI/Linux/initramfs-minishell.img
+
+echo "==> Installing systemd-boot to EFI (bootloader only; no systemd in OS)"
+bootctl --esp-path=/mnt install
+
+cat > /mnt/loader/loader.conf <<LOADER
+default  minishell
+timeout  0
+editor   no
+LOADER
+
+cat > /mnt/loader/entries/minishell.conf <<ENTRY
+title   $LABEL (kernel + busybox shell)
+linux   /EFI/Linux/vmlinuz-linux
+initrd  /EFI/Linux/initramfs-minishell.img
+options quiet loglevel=3
+ENTRY
+
+echo "==> Done. Unmounting."
+umount -R /mnt
+rm -rf "$INITRAMFS_DIR" "$STAGE"
 
 echo
-echo "==> Done. Reboot and choose '${LABEL}' in your firmware boot menu."
+echo "==> Install complete. Reboot when ready."
