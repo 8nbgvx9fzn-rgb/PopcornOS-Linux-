@@ -64,13 +64,21 @@ tar -xzf "$WORK/APKINDEX.tar.gz" -C "$WORK"
 APKINDEX="$WORK/APKINDEX"
 
 pkg_ver() {
-  # prints version for package name from APKINDEX (first match)
-  local pkg="$1"
-  awk -v P="$pkg" '
-    $0=="P:"P {found=1}
-    found && $1=="V:"{print substr($0,3); exit}
-    $0==""{found=0}
-  ' "$APKINDEX"
+  # Extract version for a package name from an APKINDEX file.
+  # Records are separated by blank lines. We find record where P:<name> then read V:<ver>.
+  local index_file="$1"
+  local pkg="$2"
+  awk -v pkg="$pkg" '
+    BEGIN{RS=""; FS="\n"}
+    {
+      p=""; v=""
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^P:/) p=substr($i,3)
+        else if ($i ~ /^V:/) v=substr($i,3)
+      }
+      if (p==pkg) { print v; exit }
+    }
+  ' "$index_file"
 }
 
 VMLINUX_PKG="linux-virt"
