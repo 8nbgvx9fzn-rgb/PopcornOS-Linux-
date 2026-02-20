@@ -1,21 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
-DISK="/dev/nvme0"
+DISK="/dev/nvme0n1"
+EFI="${DISK}p1"
+ROOT="${DISK}p2"
 
 echo "==> Partitioning disk"
 sgdisk --zap-all "$DISK"
 sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"
 sgdisk -n 2:0:0     -t 2:8300 "$DISK"
 
-partprobe "$DISK"
+# Make kernel re-read the partition table
+partprobe "$DISK" || true
+udevadm settle
 
-mkfs.fat -F32 "${DISK}1"
-mkfs.ext4 -F "${DISK}2"
+mkfs.fat -F32 "$EFI"
+mkfs.ext4 -F "$ROOT"
 
-mount "${DISK}2" /mnt
+mount "$ROOT" /mnt
 mkdir -p /mnt/boot
-mount "${DISK}1" /mnt/boot
+mount "$EFI" /mnt/boot
 
 echo "==> Installing base system"
 pacstrap -K /mnt linux linux-firmware systemd
