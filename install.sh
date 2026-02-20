@@ -1,24 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-DISK="/dev/nvme0n1"   # whole disk
-ESP_SIZE="+512M"
+DISK="/dev/nvme0n1"       # whole disk
+LABEL="MINISHELL"
+VMLINUX_SRC="/boot/vmlinuz-linux"   # adjust: where your *current* kernel image is
 
 echo "==> Safety checks"
 [[ -b "$DISK" ]] || { echo "ERROR: $DISK is not a block device"; exit 1; }
-if [[ "$DISK" =~ p[0-9]+$ ]] || [[ "$DISK" =~ [0-9]+$ && "$DISK" == /dev/sd* ]]; then
-  echo "ERROR: DISK must be the whole disk (e.g. /dev/nvme0n1 or /dev/sda), not a partition"
-  exit 1
-fi
 
-echo "==> Unmounting anything at /mnt"
-swapoff -a || true
 umount -R /mnt 2>/dev/null || true
 
 echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:${ESP_SIZE} -t 1:ef00 "$DISK"
-
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
 sync
 partprobe "$DISK" || true
 udevadm settle
@@ -29,97 +23,60 @@ else
   EFI="${DISK}1"
 fi
 
-echo "==> Waiting for partition to appear: $EFI"
-for i in {1..40}; do
-  [[ -b "$EFI" ]] && break
-  sleep 0.2
-  udevadm settle
-done
-[[ -b "$EFI" ]] || { echo "ERROR: EFI partition not found"; lsblk; exit 1; }
-
-echo "==> Creating filesystem (FAT32 ESP)"
+echo "==> Formatting EFI partition"
 mkfs.fat -F32 "$EFI"
 
-echo "==> Mounting ESP at /mnt/efi"
-mkdir -p /mnt/efi
-mount "$EFI" /mnt/efi
+echo "==> Mounting EFI"
+mkdir -p /mnt
+mount "$EFI" /mnt
+mkdir -p /mnt/EFI/Linux
 
-# We'll build a tiny Arch userspace in tmpfs just long enough to create vmlinuz+initramfs
-echo "==> Creating tmpfs staging root at /mnt/root"
-mkdir -p /mnt/root
-mount -t tmpfs -o size=2G tmpfs /mnt/root
+echo "==> Copying kernel"
+[[ -f "$VMLINUX_SRC" ]] || { echo "ERROR: kernel not found at $VMLINUX_SRC"; exit 1; }
+cp -f "$VMLINUX_SRC" /mnt/EFI/Linux/vmlinuz.efi
 
-echo "==> Installing only what we need into staging root"
-# linux => kernel + mkinitcpio presets
-# busybox => shell inside initramfs
-pacstrap -K /mnt/root linux busybox
+echo "==> Building tiny initramfs (BusyBox + /init)"
+WORKDIR="$(mktemp -d)"
+mkdir -p "$WORKDIR"/{bin,proc,sys,dev}
 
-echo "==> Building initramfs that boots directly to a BusyBox shell"
-arch-chroot /mnt/root /bin/bash -e <<'EOF'
-set -euo pipefail
+# Prefer a STATIC busybox if available.
+# On many distros it's /bin/busybox; but it may be dynamically linked.
+# For ultra-minimal, use a statically linked busybox.
+BUSYBOX_SRC="$(command -v busybox || true)"
+[[ -n "$BUSYBOX_SRC" ]] || { echo "ERROR: busybox not found in PATH"; exit 1; }
+cp -f "$BUSYBOX_SRC" "$WORKDIR/bin/busybox"
+chmod +x "$WORKDIR/bin/busybox"
 
-# Minimal init that mounts basic pseudo-filesystems, then drops to a shell.
-cat > /init <<'INIT'
-#!/bin/sh
-mount -t proc  proc /proc
-mount -t sysfs sys  /sys
-mount -t devtmpfs dev /dev 2>/dev/null || true
+cat > "$WORKDIR/init" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox --install -s
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev || mkdir -p /dev
+
 echo
-echo "Tiny Linux: initramfs BusyBox shell"
-exec /usr/bin/busybox sh
+echo "Booted minimal Linux (initramfs only)."
+echo "Type 'poweroff -f' or 'reboot -f' if available."
+exec sh
 INIT
-chmod +x /init
+chmod +x "$WORKDIR/init"
 
-# Minimal mkinitcpio config:
-# - include /init and busybox binary in the initramfs
-# - keep only essential hooks so the initramfs can run and you have a working console/keyboard
-cat > /etc/mkinitcpio.conf <<'MK'
-MODULES=()
-BINARIES=(/usr/bin/busybox)
-FILES=(/init)
-HOOKS=(base udev autodetect modconf keyboard keymap consolefont)
-COMPRESSION="zstd"
-MK
+# Pack initramfs
+( cd "$WORKDIR" && find . -print0 | cpio --null -ov --format=newc ) | gzip -9 > /mnt/EFI/Linux/initramfs.img
+rm -rf "$WORKDIR"
 
-# Generate initramfs (creates /boot/initramfs-linux.img) using our config
-mkinitcpio -c /etc/mkinitcpio.conf -g /boot/initramfs-linux.img
-EOF
+sync
 
-echo "==> Installing systemd-boot to the ESP"
-# bootctl is available on the Arch ISO environment; install directly to the mounted ESP
-bootctl --esp-path=/mnt/efi install
-
-echo "==> Copying kernel + initramfs to the ESP (only persistent artifacts)"
-# Put kernel/initramfs in the ESP root for simple systemd-boot entries
-cp -f /mnt/root/boot/vmlinuz-linux /mnt/efi/vmlinuz-linux
-cp -f /mnt/root/boot/initramfs-linux.img /mnt/efi/initramfs-linux.img
-
-echo "==> Writing systemd-boot loader entry (no root=..., boots initramfs shell)"
-mkdir -p /mnt/efi/loader/entries
-
-cat > /mnt/efi/loader/loader.conf <<'LOADER'
-default tiny
-timeout 0
-editor no
-LOADER
-
-cat > /mnt/efi/loader/entries/tiny.conf <<'ENTRY'
-title   Tiny initramfs shell
-linux   /vmlinuz-linux
-initrd  /initramfs-linux.img
-options rdinit=/init quiet loglevel=3
-ENTRY
-
-echo "==> Verification"
-echo "--- loader entry ---"
-cat /mnt/efi/loader/entries/tiny.conf
-echo "--- ESP contents ---"
-ls -lah /mnt/efi | sed -n '1,200p'
-
-echo "==> Cleanup"
-umount -R /mnt/root
-umount -R /mnt/efi
+echo "==> Creating UEFI boot entry (EFI stub kernel)"
+# You may need to adjust -p and the loader path depending on your firmware expectations.
+# The loader path is from the EFI partition root.
+efibootmgr -c \
+  -d "$DISK" -p 1 \
+  -L "$LABEL" \
+  -l '\EFI\Linux\vmlinuz.efi' \
+  -u "initrd=\EFI\Linux\initramfs.img rdinit=/init quiet"
 
 echo
-echo "==> Done. Reboot to get a BusyBox shell with no users, no services, no root filesystem."
-reboot
+echo "==> Done."
+echo "Reboot and pick '$LABEL' in firmware boot menu."
