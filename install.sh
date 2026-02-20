@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Include the base kernel, busybox and kmod as before, but also
-# pull in linux-firmware and the NVIDIA proprietary stack.  The
-# nvidia package provides the closed‑source kernel modules built for
-# the currently installed kernel, and nvidia‑utils provides userland
-# libraries and tools.  These packages are needed so we can copy
-# their modules into our custom initramfs below.
-PACKAGES=(linux busybox kmod linux-firmware nvidia nvidia-utils)
+# Include the base kernel, busybox, kmod and firmware.  We do not
+# attempt to install the proprietary NVIDIA drivers here because
+# depending on your mirror configuration they may not be available
+# (e.g. "error: target not found: nvidia").  Instead we rely on the
+# built‑in open source driver (nouveau) and will only load the
+# proprietary modules if they are present in the staged root.
+PACKAGES=(linux busybox kmod linux-firmware)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
 
@@ -93,12 +93,18 @@ echo "Loading drivers..."
 /usr/bin/modprobe snd-hda-intel 2>/dev/null || true
 /usr/bin/modprobe mt7925e 2>/dev/null || true
 
-# NVIDIA proprietary modules; enable KMS via nvidia_drm.modeset
+# NVIDIA proprietary modules; enable KMS via nvidia_drm.modeset if present.
 echo 1 > /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || true
 /usr/bin/modprobe nvidia 2>/dev/null || true
 /usr/bin/modprobe nvidia_modeset 2>/dev/null || true
 /usr/bin/modprobe nvidia_uvm 2>/dev/null || true
 /usr/bin/modprobe nvidia_drm 2>/dev/null || true
+
+# Fallback to open source nouveau driver if proprietary driver is unavailable.
+# This will load even if nvidia failed earlier because modprobe will try
+# nouveau only if it hasn't been loaded yet.  If both are unavailable
+# nothing happens.
+/usr/bin/modprobe nouveau 2>/dev/null || true
 
 echo "Loaded modules:"
 /usr/bin/lsmod 2>/dev/null || true
@@ -227,7 +233,12 @@ ln -sf /usr/bin/kmod "$INITRAMFS_DIR/usr/bin/modinfo"
 # Copy module metadata and the requested drivers into the initramfs.  If a
 # module does not exist, copy_module_with_deps will simply do nothing.
 copy_module_meta
-for mod in i915 snd-hda-intel mt7925e nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
+# Always include open source drivers: i915 for Intel GPUs, snd‑hda‑intel for
+# audio, mt7925e for MediaTek Wi‑Fi, and nouveau for NVIDIA GPUs.  We also
+# attempt to include NVIDIA proprietary modules if they are present in the
+# staged root.  copy_module_with_deps will silently skip any module that
+# cannot be found.
+for mod in i915 snd-hda-intel mt7925e nouveau nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
   copy_module_with_deps "$mod"
 done
 
