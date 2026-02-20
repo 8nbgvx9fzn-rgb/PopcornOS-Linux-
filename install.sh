@@ -1,12 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# Ultra-minimal "kernel + initramfs shell" installer for a UEFI device.
-# FIX: Avoid creating UEFI NVRAM boot entries ("Linux Boot Manager") by NOT installing a boot manager.
-# Instead, build a single Unified Kernel Image (UKI) and place it at the UEFI fallback path:
-#   \EFI\BOOT\BOOTX64.EFI
-# Most embedded/appliance UEFI firmwares will boot this automatically without touching NVRAM.
-
 PACKAGES=(linux busybox kmod linux-firmware systemd binutils)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
