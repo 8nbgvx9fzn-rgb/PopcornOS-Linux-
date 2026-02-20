@@ -44,11 +44,9 @@ mkdir -p /mnt/EFI/Linux
 mkdir -p /mnt/loader/entries
 
 # We'll use a temporary staging root to install packages and build initramfs.
-STAGE="/mnt/stage"
+STAGE="/tmp/stage"
+rm -rf "$STAGE"
 mkdir -p "$STAGE"
-
-echo "==> Installing minimal build inputs into staging root (linux + busybox)"
-# mkinitcpio is NOT required in this approach; we build initramfs manually.
 pacstrap -K "$STAGE" linux busybox
 
 echo "==> Building ultra-minimal initramfs (busybox + libs + /init)"
