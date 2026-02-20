@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-DISK="/dev/sda"
+DISK="/dev/nvme0"
 
 echo "==> Partitioning disk"
 sgdisk --zap-all "$DISK"
