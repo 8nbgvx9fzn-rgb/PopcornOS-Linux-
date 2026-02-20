@@ -1,58 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= CONFIG =========
-DISK="/dev/nvme0n1"          # target disk (WILL BE WIPED)
-LABEL="MINISHELL"
+DISK="${DISK:-/dev/nvme0n1}"    # set DISK=/dev/sdX when running
+LABEL="${LABEL:-MINISHELL}"
+ALPINE_BRANCH="${ALPINE_BRANCH:-v3.22}"   # stable branch; can use v3.23 etc.
+ALPINE_REPO="${ALPINE_REPO:-main}"
+ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 
-# Kernel: Arch Linux package (x86_64)
-ARCH_MIRROR_BASE="https://ro.arch.niranjan.co/core-testing/os/x86_64"
-ARCH_LINUX_PKG="linux-6.18.9.arch1-2-x86_64.pkg.tar.zst"
-
-# BusyBox: Debian static busybox (amd64)
-DEBIAN_POOL_BASE="https://ftp.debian.org/debian/pool/main/b/busybox"
-DEBIAN_BUSYBOX_DEB="busybox-static_1.35.0-4+b7_amd64.deb"
-
-# ========= HELPERS =========
-need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing required tool: $1"; exit 1; }; }
-
-echo "==> Checking required tools"
-# partition/format/boot
+# --- Requirements on the live environment ---
+need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing '$1'"; exit 1; }; }
 need sgdisk
 need mkfs.fat
-need mount
-need umount
 need efibootmgr
-need partprobe || true
-need udevadm || true
-# download/extract/build initramfs
-need curl
-need zstd
 need tar
-need cpio
 need gzip
-need ar
+need cpio
+need awk
+need sed
+need curl
 
-[[ -b "$DISK" ]] || { echo "ERROR: $DISK is not a block device"; exit 1; }
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) ALPINE_ARCH="x86_64" ;;
+  aarch64) ALPINE_ARCH="aarch64" ;;
+  *) echo "ERROR: unsupported arch '$ARCH'"; exit 1 ;;
+esac
 
-echo "==> WARNING: This will ERASE ${DISK}"
-echo "    (Ctrl-C to abort)"
-sleep 2
+BASE_URL="${ALPINE_MIRROR}/${ALPINE_BRANCH}/${ALPINE_REPO}/${ALPINE_ARCH}"
 
-# ========= PREP =========
+echo "==> Using Alpine repo: ${BASE_URL}"
+echo "==> Target disk: ${DISK}"
+
 umount -R /mnt 2>/dev/null || true
-mkdir -p /mnt
 
-WORK="$(mktemp -d)"
-cleanup() { umount -R /mnt 2>/dev/null || true; rm -rf "$WORK"; }
-trap cleanup EXIT
-
-# ========= PARTITION =========
 echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
 sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
 sync
-partprobe "$DISK" 2>/dev/null || true
+partprobe "$DISK" || true
 udevadm settle 2>/dev/null || true
 
 if [[ "$DISK" == /dev/nvme* ]]; then
@@ -61,75 +46,78 @@ else
   EFI="${DISK}1"
 fi
 
-echo "==> Formatting EFI partition: $EFI"
+echo "==> Formatting EFI partition"
 mkfs.fat -F32 "$EFI"
 
-echo "==> Mounting EFI to /mnt"
+echo "==> Mounting EFI"
+mkdir -p /mnt
 mount "$EFI" /mnt
 mkdir -p /mnt/EFI/Linux
 
-# ========= DOWNLOAD KERNEL =========
-echo "==> Downloading kernel package from Arch mirror"
-KPKG="${WORK}/${ARCH_LINUX_PKG}"
-curl -fL --retry 5 --retry-delay 2 -o "$KPKG" "${ARCH_MIRROR_BASE}/${ARCH_LINUX_PKG}"
+WORK="$(mktemp -d)"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+echo "==> Downloading APKINDEX to resolve latest package filenames"
+curl -fsSL "${BASE_URL}/APKINDEX.tar.gz" -o "$WORK/APKINDEX.tar.gz"
+tar -xzf "$WORK/APKINDEX.tar.gz" -C "$WORK"
+APKINDEX="$WORK/APKINDEX"
+
+pkg_ver() {
+  # prints version for package name from APKINDEX (first match)
+  local pkg="$1"
+  awk -v P="$pkg" '
+    $0=="P:"P {found=1}
+    found && $1=="V:"{print substr($0,3); exit}
+    $0==""{found=0}
+  ' "$APKINDEX"
+}
+
+VMLINUX_PKG="linux-virt"
+BUSYBOX_PKG="busybox-static"
+
+VMLINUX_VER="$(pkg_ver "$VMLINUX_PKG")"
+BUSYBOX_VER="$(pkg_ver "$BUSYBOX_PKG")"
+
+[[ -n "$VMLINUX_VER" ]] || { echo "ERROR: could not find $VMLINUX_PKG in APKINDEX"; exit 1; }
+[[ -n "$BUSYBOX_VER" ]] || { echo "ERROR: could not find $BUSYBOX_PKG in APKINDEX"; exit 1; }
+
+VMLINUX_APK="${VMLINUX_PKG}-${VMLINUX_VER}.apk"
+BUSYBOX_APK="${BUSYBOX_PKG}-${BUSYBOX_VER}.apk"
+
+echo "==> Resolved:"
+echo "    ${VMLINUX_APK}"
+echo "    ${BUSYBOX_APK}"
+
+echo "==> Downloading packages"
+curl -fsSL "${BASE_URL}/${VMLINUX_APK}" -o "$WORK/${VMLINUX_APK}"
+curl -fsSL "${BASE_URL}/${BUSYBOX_APK}" -o "$WORK/${BUSYBOX_APK}"
 
 echo "==> Extracting kernel package"
-KEX="${WORK}/arch-kernel"
-mkdir -p "$KEX"
-# Arch pkg is .tar.zst
-tar --use-compress-program=unzstd -xf "$KPKG" -C "$KEX"
+mkdir -p "$WORK/kpkg"
+tar -xzf "$WORK/${VMLINUX_APK}" -C "$WORK/kpkg"
 
-# Arch linux package typically includes /boot/vmlinuz-linux
-VMLINUX_PATH=""
-if [[ -f "$KEX/boot/vmlinuz-linux" ]]; then
-  VMLINUX_PATH="$KEX/boot/vmlinuz-linux"
-else
-  # fallback: find any vmlinuz*
-  VMLINUX_PATH="$(find "$KEX" -type f -name 'vmlinuz*' | head -n 1 || true)"
-fi
-[[ -n "$VMLINUX_PATH" && -f "$VMLINUX_PATH" ]] || { echo "ERROR: could not find vmlinuz in kernel package"; exit 1; }
+VMLINUX_SRC="$(find "$WORK/kpkg" -maxdepth 2 -type f -name 'vmlinuz-*' | head -n 1)"
+[[ -n "${VMLINUX_SRC:-}" ]] || { echo "ERROR: couldn't find vmlinuz-* inside ${VMLINUX_APK}"; exit 1; }
 
-echo "==> Installing kernel to EFI"
-cp -f "$VMLINUX_PATH" /mnt/EFI/Linux/vmlinuz.efi
+echo "==> Copying kernel to EFI"
+cp -f "$VMLINUX_SRC" /mnt/EFI/Linux/vmlinuz.efi
 
-# ========= DOWNLOAD BUSYBOX STATIC =========
-echo "==> Downloading static BusyBox from Debian pool"
-BDEB="${WORK}/${DEBIAN_BUSYBOX_DEB}"
-curl -fL --retry 5 --retry-delay 2 -o "$BDEB" "${DEBIAN_POOL_BASE}/${DEBIAN_BUSYBOX_DEB}"
+echo "==> Extracting busybox-static"
+mkdir -p "$WORK/bbpkg"
+tar -xzf "$WORK/${BUSYBOX_APK}" -C "$WORK/bbpkg"
 
-echo "==> Extracting BusyBox from .deb"
-BEX="${WORK}/debian-busybox"
-mkdir -p "$BEX"
-(
-  cd "$BEX"
-  ar x "$BDEB"   # extracts control.tar.*, data.tar.*, debian-binary
-)
+# Busybox binary location can vary; pick the first executable named busybox*
+BUSYBOX_BIN="$(find "$WORK/bbpkg" -type f -name 'busybox*' -perm -111 | head -n 1)"
+[[ -n "${BUSYBOX_BIN:-}" ]] || { echo "ERROR: couldn't find busybox binary in ${BUSYBOX_APK}"; exit 1; }
 
-DATA_TAR="$(ls -1 "$BEX"/data.tar.* | head -n 1 || true)"
-[[ -n "$DATA_TAR" && -f "$DATA_TAR" ]] || { echo "ERROR: could not find data.tar.* inside .deb"; exit 1; }
+echo "==> Building tiny initramfs (busybox + /init)"
+INITRD="$WORK/initrd"
+mkdir -p "$INITRD"/{bin,proc,sys,dev}
+cp -f "$BUSYBOX_BIN" "$INITRD/bin/busybox"
+chmod +x "$INITRD/bin/busybox"
 
-ROOTFS="${WORK}/initramfs"
-mkdir -p "$ROOTFS"
-tar -xf "$DATA_TAR" -C "$ROOTFS"
-
-# Debian busybox-static installs /bin/busybox (commonly)
-BUSYBOX_BIN=""
-if [[ -f "$ROOTFS/bin/busybox" ]]; then
-  BUSYBOX_BIN="$ROOTFS/bin/busybox"
-else
-  BUSYBOX_BIN="$(find "$ROOTFS" -type f -name busybox | head -n 1 || true)"
-fi
-[[ -n "$BUSYBOX_BIN" && -f "$BUSYBOX_BIN" ]] || { echo "ERROR: could not locate busybox binary after extracting"; exit 1; }
-
-# ========= BUILD MIN INITRAMFS =========
-echo "==> Building minimal initramfs"
-INITDIR="${WORK}/initdir"
-mkdir -p "$INITDIR"/{bin,proc,sys,dev}
-
-cp -f "$BUSYBOX_BIN" "$INITDIR/bin/busybox"
-chmod +x "$INITDIR/bin/busybox"
-
-cat > "$INITDIR/init" <<'INIT'
+cat > "$INITRD/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox --install -s
 
@@ -138,19 +126,16 @@ mount -t sysfs none /sys
 mount -t devtmpfs none /dev || mkdir -p /dev
 
 echo
-echo "Minimal Linux booted (initramfs-only)."
-echo "Try: ls, dmesg, mount, cat /proc/cpuinfo"
+echo "Minimal Linux booted (initramfs only)."
 exec sh
 INIT
-chmod +x "$INITDIR/init"
+chmod +x "$INITRD/init"
 
-( cd "$INITDIR" && find . -print0 | cpio --null -ov --format=newc ) | gzip -9 > /mnt/EFI/Linux/initramfs.img
+( cd "$INITRD" && find . -print0 | cpio --null -ov --format=newc ) | gzip -9 > /mnt/EFI/Linux/initramfs.img
+
 sync
 
-# ========= UEFI BOOT ENTRY =========
-echo "==> Creating UEFI boot entry (EFI-stub kernel)"
-# -l path is relative to EFI system partition root, backslashes required
-# -u passes kernel command line; initrd path is also relative to EFI partition root
+echo "==> Creating UEFI boot entry (EFI stub kernel)"
 efibootmgr -c \
   -d "$DISK" -p 1 \
   -L "$LABEL" \
@@ -158,5 +143,4 @@ efibootmgr -c \
   -u "initrd=\EFI\Linux\initramfs.img rdinit=/init quiet"
 
 echo
-echo "==> DONE."
-echo "Reboot and choose '$LABEL' in your firmware boot menu."
+echo "==> Done. Reboot and choose '${LABEL}' in your firmware boot menu."
