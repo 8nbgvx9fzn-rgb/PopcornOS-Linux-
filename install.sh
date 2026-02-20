@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+PACKAGES=(linux busybox kmod linux-firmware kodi)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
 
@@ -47,7 +48,7 @@ mkdir -p /mnt/loader/entries
 STAGE="/tmp/stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-pacstrap -K "$STAGE" linux busybox
+pacstrap -K "$STAGE" "${PACKAGES[@]}"
 
 echo "==> Building ultra-minimal initramfs (busybox + libs + /init)"
 INITRAMFS_DIR="/tmp/initramfs.$$"
