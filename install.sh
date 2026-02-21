@@ -1,17 +1,32 @@
 #!/bin/bash
 set -euo pipefail
 
-PACKAGES=(linux busybox kmod linux-firmware systemd binutils efibootmgr)
+PACKAGES=(linux busybox kmod linux-firmware)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
-BOOT_LABEL="MINISHELL-UKI"
 
 echo "==> Safety checks"
 [[ -b "$DISK" ]] || { echo "ERROR: $DISK is not a block device"; exit 1; }
+if [[ "$DISK" =~ p[0-9]+$ ]] || [[ "$DISK" =~ [0-9]+$ && "$DISK" == /dev/sd* ]]; then
+  echo "ERROR: DISK must be a whole disk (e.g. /dev/nvme0n1 or /dev/sda), not a partition"
+  exit 1
+fi
 
 echo "==> Unmounting /mnt"
 swapoff -a || true
 umount -R /mnt 2>/dev/null || true
+
+echo "==> Removing lingering UEFI NVRAM entries (best-effort)"
+if command -v efibootmgr >/dev/null 2>&1; then
+  # Remove prior systemd-boot entries (commonly labeled \"Linux Boot Manager\") so they don't accumulate.
+  # NVRAM lives on the motherboard, so wiping the disk does not remove these.
+  efibootmgr -v | sed -n 's/^Boot\([0-9A-Fa-f]\+\)\* .*Linux Boot Manager.*/\1/p' | while read -r id; do
+    [[ -n "$id" ]] || continue
+    efibootmgr -b "$id" -B || true
+  done
+else
+  echo "    (efibootmgr not found; skipping NVRAM cleanup)"
+fi
 
 echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
@@ -22,49 +37,25 @@ partprobe "$DISK" || true
 udevadm settle
 
 if [[ "$DISK" == /dev/nvme* ]]; then
-  EFI_PART="${DISK}p1"
+  EFI="${DISK}p1"
 else
-  EFI_PART="${DISK}1"
+  EFI="${DISK}1"
 fi
 
-echo "==> Waiting for EFI partition: $EFI_PART"
-for i in {1..30}; do
-  [[ -b "$EFI_PART" ]] && break
+echo "==> Waiting for EFI partition: $EFI"
+for i in {1..20}; do
+  [[ -b "$EFI" ]] && break
   sleep 0.2
   udevadm settle
 done
-[[ -b "$EFI_PART" ]] || { echo "ERROR: partition not found"; lsblk; exit 1; }
+[[ -b "$EFI" ]] || { echo "ERROR: partition not found"; lsblk; exit 1; }
 
 echo "==> Formatting + mounting EFI (FAT32)"
-mkfs.fat -F32 -n EFI "$EFI_PART"
-mount "$EFI_PART" /mnt
+mkfs.fat -F32 -n EFI "$EFI"
+mount "$EFI" /mnt
+mkdir -p /mnt/EFI/Linux
 
-mkdir -p /mnt/EFI/Linux /mnt/EFI/BOOT
-
-# Detect UEFI architecture (best-effort via uname -m; for most live media this matches firmware arch)
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64)
-    BOOT_EFI="BOOTX64.EFI"
-    STUB_REL="usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-    ;;
-  i686|i386)
-    BOOT_EFI="BOOTIA32.EFI"
-    STUB_REL="usr/lib/systemd/boot/efi/linuxia32.efi.stub"
-    ;;
-  aarch64|arm64)
-    BOOT_EFI="BOOTAA64.EFI"
-    STUB_REL="usr/lib/systemd/boot/efi/linuxaa64.efi.stub"
-    ;;
-  *)
-    echo "ERROR: Unsupported arch '$ARCH'. Set BOOT_EFI and STUB_REL manually in script."
-    exit 1
-    ;;
-esac
-
-echo "==> Using fallback EFI name: $BOOT_EFI (arch=$ARCH)"
-
-# Temporary staging root for packages needed to build the UKI.
+# We'll use a temporary staging root to install packages and build initramfs.
 STAGE="/tmp/stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
@@ -75,11 +66,15 @@ INITRAMFS_DIR="/tmp/initramfs.$$"
 rm -rf "$INITRAMFS_DIR"
 mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,root}
 
+# Copy busybox
 cp -a "$STAGE/usr/bin/busybox" "$INITRAMFS_DIR/bin/busybox"
+
+# Create applet symlinks we care about (add more if you want)
 for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep; do
   ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
 done
 
+# Minimal /init: mount pseudo-filesystems and drop to shell
 cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
 mount -t proc  proc  /proc
@@ -96,6 +91,8 @@ exec /bin/sh
 INIT
 chmod +x "$INITRAMFS_DIR/init"
 
+# Copy dynamic linker + libs needed by busybox (Arch busybox is usually dynamic)
+# This is the part that makes the initramfs actually boot reliably.
 echo "==> Copying shared libs for busybox"
 mapfile -t libs < <(ldd "$STAGE/usr/bin/busybox" | awk '
   $2 == "=>" { print $3 }
@@ -104,11 +101,14 @@ mapfile -t libs < <(ldd "$STAGE/usr/bin/busybox" | awk '
 
 for f in "${libs[@]}"; do
   [[ -f "$f" ]] || continue
+  # Preserve lib64 vs lib layout
   dest="$INITRAMFS_DIR${f}"
   mkdir -p "$(dirname "$dest")"
   cp -a "$f" "$dest"
 done
 
+# Also copy the dynamic loader explicitly if ldd didn’t list it plainly
+# (common paths: /lib64/ld-linux-x86-64.so.2, /lib/ld-linux-*.so.*)
 for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.*; do
   if [[ -f "$loader" ]]; then
     mkdir -p "$INITRAMFS_DIR$(dirname "$loader")"
@@ -116,77 +116,64 @@ for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.*; do
   fi
 done
 
-echo "==> Creating initramfs image on ESP"
+echo "==> Copying kernel + building initramfs image"
+# Kernel image from staging (Arch installs it in /boot within the staged root)
+cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
+
+# Create initramfs cpio (gzip for compatibility; you can use xz if you want)
 (
   cd "$INITRAMFS_DIR"
   find . -print0 | cpio --null -ov --format=newc
 ) | gzip -9 > /mnt/EFI/Linux/initramfs-minishell.img
 
-echo "==> Copying kernel (debug/reference)"
-cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
+echo "==> Installing direct UEFI boot (no NVRAM entries): Unified Kernel Image at fallback path"
+# This avoids creating \"Linux Boot Manager\" entries in NVRAM and boots directly via the UEFI fallback path.
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64)
+    BOOT_EFI="BOOTX64.EFI"
+    STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+    ;;
+  aarch64|arm64)
+    BOOT_EFI="BOOTAA64.EFI"
+    STUB="/usr/lib/systemd/boot/efi/linuxaa64.efi.stub"
+    ;;
+  *)
+    echo "ERROR: unsupported arch: $ARCH (extend script with the right UEFI fallback name + stub path)"
+    exit 1
+    ;;
+esac
 
-echo "==> Building UKI at fallback path: \\EFI\\BOOT\\$BOOT_EFI"
-STUB="$STAGE/$STUB_REL"
+command -v objcopy >/dev/null 2>&1 || { echo "ERROR: objcopy not found (install binutils in the live environment)"; exit 1; }
 [[ -f "$STUB" ]] || { echo "ERROR: systemd EFI stub not found at $STUB"; exit 1; }
 
-# Prefer host objcopy if present; otherwise run staged objcopy with staged libraries
-if command -v objcopy >/dev/null 2>&1; then
-  OBJCOPY_BIN="$(command -v objcopy)"
-  OBJCOPY_ENV=()
-else
-  OBJCOPY_BIN="$STAGE/usr/bin/objcopy"
-  [[ -x "$OBJCOPY_BIN" ]] || { echo "ERROR: objcopy not found (install binutils in live env, or check pacstrap)"; exit 1; }
-  OBJCOPY_ENV=(env "LD_LIBRARY_PATH=$STAGE/usr/lib:$STAGE/usr/lib64")
-fi
-
-CMDLINE_FILE="/tmp/cmdline.$$"
-OSREL_FILE="/tmp/os-release.$$"
+echo "==> Building UKI (kernel+initramfs+cmdline) and placing it at /EFI/BOOT/$BOOT_EFI"
+mkdir -p /mnt/EFI/BOOT
+CMDLINE_FILE="$(mktemp)"
+OSREL_FILE="$(mktemp)"
 echo "quiet loglevel=3" > "$CMDLINE_FILE"
-cat > "$OSREL_FILE" <<EOF
-NAME="$LABEL"
+cat > "$OSREL_FILE" <<'EOF'
+NAME=MINISHELL
 ID=minishell
-PRETTY_NAME="$LABEL (UKI)"
+VERSION=1
 EOF
 
-"${OBJCOPY_ENV[@]}" "$OBJCOPY_BIN" \
-  --add-section .osrel="$OSREL_FILE"     --change-section-vma .osrel=0x20000 \
+# Build UKI to the UEFI removable-media fallback location.
+# Firmware can boot this without a Boot#### NVRAM entry.
+objcopy \
+  --add-section .osrel="$OSREL_FILE"    --change-section-vma .osrel=0x20000 \
   --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x30000 \
-  --add-section .linux="$STAGE/boot/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
-  --add-section .initrd=/mnt/EFI/Linux/initramfs-minishell.img --change-section-vma .initrd=0x3000000 \
+  --add-section .linux="/mnt/EFI/Linux/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
+  --add-section .initrd="/mnt/EFI/Linux/initramfs-minishell.img" --change-section-vma .initrd=0x3000000 \
   "$STUB" "/mnt/EFI/BOOT/$BOOT_EFI"
 
-sync
+rm -f "$CMDLINE_FILE" "$OSREL_FILE" || true
 
-echo "==> Verifying EFI file"
-if command -v file >/dev/null 2>&1; then
-  file "/mnt/EFI/BOOT/$BOOT_EFI" || true
-fi
-
-# Optional: create a single NVRAM entry (after deleting prior entries with the same label)
-if [[ "${CREATE_NVRAM_ENTRY:-0}" == "1" ]]; then
-  if [[ -d /sys/firmware/efi/efivars ]]; then
-    echo "==> Cleaning prior NVRAM entries named '$BOOT_LABEL' (prevents zombie Boot#### entries)"
-    mapfile -t boots < <(efibootmgr | awk -v lbl="$BOOT_LABEL" '$0 ~ lbl {gsub(/^Boot|\\*$/, "", $1); print $1}')
-    for b in "${boots[@]}"; do
-      [[ -n "$b" ]] && efibootmgr -b "$b" -B || true
-    done
-
-    echo "==> Creating one NVRAM boot entry pointing to \\EFI\\BOOT\\$BOOT_EFI"
-    # efibootmgr uses backslashes in the loader path, and the path is relative to the ESP root.
-    efibootmgr -c -d "$DISK" -p 1 -L "$BOOT_LABEL" -l "\\EFI\\BOOT\\$BOOT_EFI" || {
-      echo "WARN: Failed to create NVRAM entry. Firmware may still boot via fallback path."
-    }
-  else
-    echo "WARN: Not booted in UEFI mode (no efivars). Skipping NVRAM entry creation."
-  fi
-fi
+echo "==> UKI installed. Firmware should boot /EFI/BOOT/$BOOT_EFI directly."
 
 echo "==> Done. Unmounting."
 umount -R /mnt
-rm -rf "$INITRAMFS_DIR" "$STAGE" "$CMDLINE_FILE" "$OSREL_FILE"
+rm -rf "$INITRAMFS_DIR" "$STAGE"
 
 echo
-echo "==> Install complete."
-echo "==> UKI installed to: \\EFI\\BOOT\\$BOOT_EFI"
-echo "==> If firmware doesn't boot it automatically, rerun with:"
-echo "==>   CREATE_NVRAM_ENTRY=1 $0"
+echo "==> Install complete. Reboot when ready."
