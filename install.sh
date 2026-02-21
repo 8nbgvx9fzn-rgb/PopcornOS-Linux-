@@ -66,16 +66,10 @@ done
 # Minimal /init: mount pseudo-filesystems and drop to shell
 cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
+set -e
 mount -t proc  proc  /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-
-echo
-echo "=== minishell initramfs ==="
-echo "Kernel: $(uname -a)"
-echo "Dropping to /bin/sh..."
-echo
-
+mount -t devtmpfs devtmpfs /dev
 exec /bin/sh
 INIT
 chmod +x "$INITRAMFS_DIR/init"
