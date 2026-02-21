@@ -16,18 +16,6 @@ echo "==> Unmounting /mnt"
 swapoff -a || true
 umount -R /mnt 2>/dev/null || true
 
-echo "==> Removing lingering UEFI NVRAM entries (best-effort)"
-if command -v efibootmgr >/dev/null 2>&1; then
-  # Remove prior systemd-boot entries (commonly labeled \"Linux Boot Manager\") so they don't accumulate.
-  # NVRAM lives on the motherboard, so wiping the disk does not remove these.
-  efibootmgr -v | sed -n 's/^Boot\([0-9A-Fa-f]\+\)\* .*Linux Boot Manager.*/\1/p' | while read -r id; do
-    [[ -n "$id" ]] || continue
-    efibootmgr -b "$id" -B || true
-  done
-else
-  echo "    (efibootmgr not found; skipping NVRAM cleanup)"
-fi
-
 echo "==> Partitioning disk (GPT: EFI only)"
 sgdisk --zap-all "$DISK"
 sgdisk -n 1:0:+1024M -t 1:ef00 -c 1:"EFI" "$DISK"
@@ -54,6 +42,7 @@ echo "==> Formatting + mounting EFI (FAT32)"
 mkfs.fat -F32 -n EFI "$EFI"
 mount "$EFI" /mnt
 mkdir -p /mnt/EFI/Linux
+mkdir -p /mnt/loader/entries
 
 # We'll use a temporary staging root to install packages and build initramfs.
 STAGE="/tmp/stage"
@@ -126,75 +115,21 @@ cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
   find . -print0 | cpio --null -ov --format=newc
 ) | gzip -9 > /mnt/EFI/Linux/initramfs-minishell.img
 
-echo "==> Installing direct UEFI boot (no NVRAM entries): Unified Kernel Image at fallback path"
-# This avoids creating \"Linux Boot Manager\" entries in NVRAM and boots directly via the UEFI fallback path.
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64)
-    BOOT_EFI="BOOTX64.EFI"
-    STUB="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-    ;;
-  aarch64|arm64)
-    BOOT_EFI="BOOTAA64.EFI"
-    STUB="/usr/lib/systemd/boot/efi/linuxaa64.efi.stub"
-    ;;
-  *)
-    echo "ERROR: unsupported arch: $ARCH (extend script with the right UEFI fallback name + stub path)"
-    exit 1
-    ;;
-esac
+echo "==> Installing systemd-boot to EFI (bootloader only; no systemd in OS)"
+bootctl --esp-path=/mnt install
 
-command -v objcopy >/dev/null 2>&1 || { echo "ERROR: objcopy not found (install binutils in the live environment)"; exit 1; }
-[[ -f "$STUB" ]] || { echo "ERROR: systemd EFI stub not found at $STUB"; exit 1; }
+cat > /mnt/loader/loader.conf <<LOADER
+default  minishell
+timeout  0
+editor   no
+LOADER
 
-mkdir -p /mnt/EFI/BOOT
-CMDLINE_FILE="$(mktemp)"
-OSREL_FILE="$(mktemp)"
-echo "quiet loglevel=3" > "$CMDLINE_FILE"
-cat > "$OSREL_FILE" <<'EOF'
-NAME=MINISHELL
-ID=minishell
-VERSION=1
-EOF
-
-# Prefer ukify (systemd) if available; it produces a UKI that tends to work on more firmwares.
-UKI_OUT="/mnt/EFI/BOOT/$BOOT_EFI"
-echo "==> Building UKI and placing it at /EFI/BOOT/$BOOT_EFI"
-if command -v ukify >/dev/null 2>&1; then
-  echo "    using ukify"
-  ukify build \
-    --linux "/mnt/EFI/Linux/vmlinuz-linux" \
-    --initrd "/mnt/EFI/Linux/initramfs-minishell.img" \
-    --cmdline "@$CMDLINE_FILE" \
-    --os-release "@$OSREL_FILE" \
-    --stub "$STUB" \
-    --output "$UKI_OUT"
-else
-  echo "    ukify not found; using objcopy"
-  # Build UKI to the UEFI removable-media fallback location.
-  # Firmware can boot this without a Boot#### NVRAM entry.
-  objcopy \
-    --add-section .osrel="$OSREL_FILE"    --change-section-vma .osrel=0x20000 \
-    --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x30000 \
-    --add-section .linux="/mnt/EFI/Linux/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
-    --add-section .initrd="/mnt/EFI/Linux/initramfs-minishell.img" --change-section-vma .initrd=0x3000000 \
-    "$STUB" "$UKI_OUT"
-fi
-
-rm -f "$CMDLINE_FILE" "$OSREL_FILE" || true
-
-echo "==> Verifying UKI artifact"
-ls -lh "$UKI_OUT"
-file "$UKI_OUT" || true
-
-# Secure Boot note: if enabled, firmware will reject an unsigned EFI binary.
-if command -v mokutil >/dev/null 2>&1; then
-  mokutil --sb-state || true
-fi
-echo "==> If Secure Boot is enabled and this won't boot, disable Secure Boot or sign the UKI."
-
-
-echo "==> UKI installed. Firmware should boot /EFI/BOOT/$BOOT_EFI directly."
+cat > /mnt/loader/entries/minishell.conf <<ENTRY
+title   $LABEL (kernel + busybox shell)
+linux   /EFI/Linux/vmlinuz-linux
+initrd  /EFI/Linux/initramfs-minishell.img
+options quiet loglevel=3
+ENTRY
 
 echo "==> Done. Unmounting."
 umount -R /mnt
