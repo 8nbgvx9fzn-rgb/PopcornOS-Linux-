@@ -1,5 +1,5 @@
 #!/bin/bash
-pacnan -Sy --no-confirm cpio
+pacnan -Sy --noconfirm cpio
 
 set -euo pipefail
 
