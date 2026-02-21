@@ -1,6 +1,4 @@
 #!/bin/bash
-pacnan -Sy --noconfirm cpio
-
 set -euo pipefail
 
 PACKAGES=(linux busybox kmod linux-firmware)
