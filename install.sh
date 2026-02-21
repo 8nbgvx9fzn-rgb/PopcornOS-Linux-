@@ -147,7 +147,6 @@ esac
 command -v objcopy >/dev/null 2>&1 || { echo "ERROR: objcopy not found (install binutils in the live environment)"; exit 1; }
 [[ -f "$STUB" ]] || { echo "ERROR: systemd EFI stub not found at $STUB"; exit 1; }
 
-echo "==> Building UKI (kernel+initramfs+cmdline) and placing it at /EFI/BOOT/$BOOT_EFI"
 mkdir -p /mnt/EFI/BOOT
 CMDLINE_FILE="$(mktemp)"
 OSREL_FILE="$(mktemp)"
@@ -158,16 +157,42 @@ ID=minishell
 VERSION=1
 EOF
 
-# Build UKI to the UEFI removable-media fallback location.
-# Firmware can boot this without a Boot#### NVRAM entry.
-objcopy \
-  --add-section .osrel="$OSREL_FILE"    --change-section-vma .osrel=0x20000 \
-  --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x30000 \
-  --add-section .linux="/mnt/EFI/Linux/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
-  --add-section .initrd="/mnt/EFI/Linux/initramfs-minishell.img" --change-section-vma .initrd=0x3000000 \
-  "$STUB" "/mnt/EFI/BOOT/$BOOT_EFI"
+# Prefer ukify (systemd) if available; it produces a UKI that tends to work on more firmwares.
+UKI_OUT="/mnt/EFI/BOOT/$BOOT_EFI"
+echo "==> Building UKI and placing it at /EFI/BOOT/$BOOT_EFI"
+if command -v ukify >/dev/null 2>&1; then
+  echo "    using ukify"
+  ukify build \
+    --linux "/mnt/EFI/Linux/vmlinuz-linux" \
+    --initrd "/mnt/EFI/Linux/initramfs-minishell.img" \
+    --cmdline "@$CMDLINE_FILE" \
+    --os-release "@$OSREL_FILE" \
+    --stub "$STUB" \
+    --output "$UKI_OUT"
+else
+  echo "    ukify not found; using objcopy"
+  # Build UKI to the UEFI removable-media fallback location.
+  # Firmware can boot this without a Boot#### NVRAM entry.
+  objcopy \
+    --add-section .osrel="$OSREL_FILE"    --change-section-vma .osrel=0x20000 \
+    --add-section .cmdline="$CMDLINE_FILE" --change-section-vma .cmdline=0x30000 \
+    --add-section .linux="/mnt/EFI/Linux/vmlinuz-linux" --change-section-vma .linux=0x2000000 \
+    --add-section .initrd="/mnt/EFI/Linux/initramfs-minishell.img" --change-section-vma .initrd=0x3000000 \
+    "$STUB" "$UKI_OUT"
+fi
 
 rm -f "$CMDLINE_FILE" "$OSREL_FILE" || true
+
+echo "==> Verifying UKI artifact"
+ls -lh "$UKI_OUT"
+file "$UKI_OUT" || true
+
+# Secure Boot note: if enabled, firmware will reject an unsigned EFI binary.
+if command -v mokutil >/dev/null 2>&1; then
+  mokutil --sb-state || true
+fi
+echo "==> If Secure Boot is enabled and this won't boot, disable Secure Boot or sign the UKI."
+
 
 echo "==> UKI installed. Firmware should boot /EFI/BOOT/$BOOT_EFI directly."
 
