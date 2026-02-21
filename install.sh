@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PACKAGES=(linux-zen busybox kmod linux-firmware)
+PACKAGES=(linux busybox kmod linux-firmware)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
 
