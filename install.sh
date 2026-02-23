@@ -96,42 +96,71 @@ LABEL="MINISHELL"
   cp -a "$STAGE/usr/bin/busybox" "$INITRAMFS_DIR/bin/busybox"
 
   # Create applet symlinks we care about (add more if you want)
-  for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep; do
+  for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep mdev mountpoint; do
     ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
   done
 
   # Minimal /init: mount pseudo-filesystems and drop to shell
   cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
+set -eu
+
+# Make sure we can find tools regardless of busybox defaults
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
 mount -t proc  proc  /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
-# Optional: for debugging
-echo "Loading storage modules..."
-# Try NVMe first
-modprobe nvme-pci 2>/dev/null || true
-modprobe nvme      2>/dev/null || true
+# Ensure /dev exists and that we have basic device nodes even if devtmpfs fails
+mkdir -p /dev
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+[ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
+[ -c /dev/kmsg ]    || mknod -m 600 /dev/kmsg    c 1 11
 
-# Try SATA/AHCI path too (safe if absent)
-modprobe ahci      2>/dev/null || true
-
-# Common block device stack (often needed for /dev/sd*)
-modprobe sd_mod    2>/dev/null || true
-modprobe scsi_mod  2>/dev/null || true
-
-# Give the kernel a moment to enumerate
-sleep 0.2
-
-echo
 echo "=== minishell initramfs ==="
 echo "Kernel: $(uname -a)"
-echo "Block devices:"
-ls -l /dev/nvme* /dev/sd* 2>/dev/null || true
-echo
-echo "Dropping to /bin/sh..."
-echo
+echo "PATH: $PATH"
+echo "Filesystems available:"
+cat /proc/filesystems || true
 
+echo "Mounting devtmpfs..."
+if mount -t devtmpfs devtmpfs /dev 2>/dev/console; then
+  echo "devtmpfs mounted OK."
+else
+  echo "WARNING: devtmpfs mount failed."
+fi
+
+# If devtmpfs isn't mounted or /dev is still basically empty, use busybox mdev to populate nodes
+# (This requires sysfs+proc mounted, which we already did.)
+if ! mountpoint -q /dev 2>/dev/null; then
+  echo "devtmpfs not mounted; trying busybox mdev fallback..."
+  mkdir -p /etc
+  : > /etc/mdev.conf
+  echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/console || true
+  mdev -s 2>/dev/console || true
+fi
+
+echo "Module directory check:"
+echo "uname -r: $(uname -r)"
+ls -la "/lib/modules/$(uname -r)" 2>/dev/console || true
+
+echo "Loading storage modules (verbose):"
+# Don't hide errors while debugging
+modprobe -v nvme-pci 2>/dev/console || true
+modprobe -v nvme      2>/dev/console || true
+modprobe -v ahci      2>/dev/console || true
+modprobe -v sd_mod    2>/dev/console || true
+modprobe -v scsi_mod  2>/dev/console || true
+
+# Give the kernel time to enumerate
+sleep 1
+
+echo "Block devices after module load:"
+ls -l /dev/nvme* /dev/sd* 2>/dev/console || true
+echo "dmesg tail:"
+dmesg | tail -200 || true
+
+echo "Dropping to shell."
 exec /bin/sh
 INIT
   chmod +x "$INITRAMFS_DIR/init"
