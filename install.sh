@@ -103,17 +103,90 @@ LABEL="MINISHELL"
   # Minimal /init: mount pseudo-filesystems and drop to shell
   cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
-mount -t proc  proc  /proc
-mount -t sysfs sysfs /sys
+set -eu
+
+# Send output to the real console
+exec >/dev/console 2>&1
+
+echo ""
+echo "=== minishell initramfs debug ==="
+
+# Mount the basics
+mkdir -p /proc /sys /dev /run
+mount -t proc  proc /proc 2>/dev/null || true
+mount -t sysfs sys /sys 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
-echo
-echo "=== minishell initramfs ==="
-echo "Kernel: $(uname -a)"
-echo "Dropping to /bin/sh..."
-echo
+echo ""
+echo "[cmdline]"
+cat /proc/cmdline 2>/dev/null || true
 
-exec /bin/sh
+echo ""
+echo "[block majors from /proc/devices]"
+# Print from 'Block devices:' down, busybox/awk-safe
+awk 'p{print} /^Block devices:/{p=1; print}' /proc/devices 2>/dev/null || true
+
+echo ""
+echo "[/sys/class/block listing]"
+ls -l /sys/class/block 2>/dev/null || true
+
+echo ""
+echo "[PCI devices: class vendor device BDF]"
+# Print all PCI devices with class/vendor/device IDs
+for d in /sys/bus/pci/devices/*; do
+  cls="$(cat "$d/class" 2>/dev/null || echo "?")"
+  ven="$(cat "$d/vendor" 2>/dev/null || echo "?")"
+  dev="$(cat "$d/device" 2>/dev/null || echo "?")"
+  echo "$cls $ven $dev $(basename "$d")"
+done | sort || true
+
+echo ""
+echo "[Mass storage controllers (class 0x01xxxx)]"
+found=0
+for d in /sys/bus/pci/devices/*; do
+  cls="$(cat "$d/class" 2>/dev/null || echo "")"
+  case "$cls" in
+    0x01*)
+      found=1
+      ven="$(cat "$d/vendor" 2>/dev/null || echo "?")"
+      dev="$(cat "$d/device" 2>/dev/null || echo "?")"
+      echo "$cls $ven $dev $d"
+      ;;
+  esac
+done
+[ "$found" -eq 0 ] && echo "(none found)"
+
+echo ""
+echo "[Try loading common storage modules if modprobe exists]"
+if command -v modprobe >/dev/null 2>&1; then
+  # Intel VMD/RST can hide NVMe behind VMD
+  modprobe vmd 2>/dev/null || true
+  # NVMe / SATA AHCI paths
+  modprobe nvme 2>/dev/null || true
+  modprobe ahci 2>/dev/null || true
+  # SCSI disk stack (often needed for SATA/USB)
+  modprobe scsi_mod 2>/dev/null || true
+  modprobe sd_mod 2>/dev/null || true
+  # VM path (harmless on bare metal)
+  modprobe virtio_pci 2>/dev/null || true
+  modprobe virtio_blk 2>/dev/null || true
+
+  sleep 1
+
+  echo ""
+  echo "[After modprobe: /sys/class/block]"
+  ls -l /sys/class/block 2>/dev/null || true
+
+  echo ""
+  echo "[After modprobe: dmesg tail]"
+  dmesg | tail -200 2>/dev/null || true
+else
+  echo "modprobe not present in initramfs (no module loading possible)."
+fi
+
+echo ""
+echo "=== dropping to shell ==="
+exec sh
 INIT
   chmod +x "$INITRAMFS_DIR/init"
 }
@@ -193,5 +266,5 @@ ENTRY
   rm -rf "$INITRAMFS_DIR" "$STAGE"
 
   echo
-  echo "==> Install complete. Reboot when ready."
+  echo "==> Install PopcornOS (debug): complete: Reboot when ready."
 }
