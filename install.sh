@@ -258,6 +258,47 @@ INIT
 }
 
 # =========================
+# BLOCK: Decompress modules in initramfs (fix "Invalid ELF header")
+# =========================
+{
+  echo "==> Decompressing kernel modules inside initramfs (if compressed)"
+  MODDST="$INITRAMFS_DIR/usr/lib/modules/$KVER"
+
+  # Decompress .ko.zst -> .ko (Arch commonly uses .ko.zst)
+  if find "$MODDST" -name '*.ko.zst' -print -quit | grep -q .; then
+    command -v unzstd >/dev/null || { echo "ERROR: unzstd not found in live environment"; exit 1; }
+
+    while IFS= read -r -d '' f; do
+      out="${f%.zst}"
+      echo "   unzstd: $(basename "$f")"
+      unzstd -c "$f" > "$out"
+      rm -f "$f"
+    done < <(find "$MODDST" -name '*.ko.zst' -print0)
+  fi
+
+  # If you ever encounter .ko.xz in your environment:
+  if find "$MODDST" -name '*.ko.xz' -print -quit | grep -q .; then
+    command -v unxz >/dev/null || { echo "ERROR: unxz not found in live environment"; exit 1; }
+
+    while IFS= read -r -d '' f; do
+      out="${f%.xz}"
+      echo "   unxz: $(basename "$f")"
+      unxz -c "$f" > "$out"
+      rm -f "$f"
+    done < <(find "$MODDST" -name '*.ko.xz' -print0)
+  fi
+}
+
+# =========================
+# BLOCK: Rebuild modules.dep for initramfs tree
+# =========================
+{
+  echo "==> Running depmod for initramfs module tree"
+  # Use host depmod (live ISO typically has it). This writes modules.dep, modules.alias, etc.
+  depmod -b "$INITRAMFS_DIR" "$KVER"
+}
+
+# =========================
 # BLOCK: Kernel + initramfs image
 # =========================
 {
