@@ -234,7 +234,7 @@ INIT
 
   # Make sure module directory is where kmod expects it
   mkdir -p "$INITRAMFS_DIR/lib"
-  ln -sf /usr/lib/modules "$INITRAMFS_DIR/lib/modules"
+  ln -sfn ../usr/lib/modules "$INITRAMFS_DIR/lib/modules"
 
   # Copy module metadata so modprobe can resolve deps/aliases
   cp -a "$MODSRC"/modules.{alias,dep,softdep,symbols,builtin,builtin.modinfo,order}* "$MODDST"/ 2>/dev/null || true
@@ -343,5 +343,5 @@ ENTRY
   rm -rf "$INITRAMFS_DIR" "$STAGE"
 
   echo
-  echo "==> Install V3 complete. Reboot when ready."
+  echo "==> Install V4 complete. Reboot when ready."
 }
