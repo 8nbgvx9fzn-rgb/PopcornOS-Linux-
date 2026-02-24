@@ -1,127 +1,123 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### ===== CONFIG (edit these) =====
-DISK="/dev/nvme0n1"          # HARD-CODED TARGET DISK (DANGEROUS)
+# -----------------------------
+# HARD-CODED TARGETS (edit me)
+# -----------------------------
+DISK="/dev/nvme0n1"          # e.g. /dev/sda or /dev/nvme0n1
 HOSTNAME="archbox"
-USERNAME="user"
+USERNAME="archuser"
 TIMEZONE="America/Phoenix"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
 
-# Packages to install (base already includes essentials)
-PKGS=(
-  base linux linux-firmware
-  amd-ucode intel-ucode
-  networkmanager sudo
-  vim git
-  grub efibootmgr
-)
-
 # Partition sizes
-EFI_SIZE="512M"              # EFI System Partition
-SWAP_SIZE="0"                # set like "8G" or "0" to disable swap partition
+EFI_SIZE="512MiB"
+SWAP_SIZE="0"               # set to e.g. 8GiB, or "0" for none
 
-### ===== END CONFIG =====
+# Packages
+BASE_PKGS=(base linux linux-firmware sudo networkmanager vim)
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run as root from the Arch ISO (live environment)."
-    exit 1
-  fi
-}
+# -----------------------------
+# Safety / environment checks
+# -----------------------------
+if [[ $EUID -ne 0 ]]; then
+  echo "Run as root (you are in the live ISO, so: sudo ./script.sh)" >&2
+  exit 1
+fi
 
-confirm_disk() {
-  echo "Target disk: ${DISK}"
-  echo "THIS WILL WIPE EVERYTHING ON ${DISK}."
-  read -r -p "Type WIPE to continue: " ans
-  [[ "${ans}" == "WIPE" ]] || { echo "Aborted."; exit 1; }
-}
+if [[ ! -b "$DISK" ]]; then
+  echo "Disk $DISK not found." >&2
+  lsblk
+  exit 1
+fi
 
-check_live_env() {
-  command -v pacstrap >/dev/null
-  command -v arch-chroot >/dev/null
-}
+# Don't allow targeting the live USB itself (best-effort).
+LIVE_DEV="$(findmnt -no SOURCE /run/archiso/bootmnt || true)"
+if [[ -n "${LIVE_DEV}" && "${LIVE_DEV}" == ${DISK}* ]]; then
+  echo "Refusing to install to what appears to be the live media: $LIVE_DEV" >&2
+  exit 1
+fi
 
-wipe_and_partition_gpt_uefi() {
-  # Requires UEFI boot; for BIOS/MBR you'd do different bootloader steps.
-  echo "Partitioning ${DISK} (GPT + UEFI)..."
+echo "About to WIPE and install Arch to: $DISK"
+lsblk "$DISK"
+sleep 3
 
-  # Unmount anything previously mounted
-  umount -R /mnt 2>/dev/null || true
-  swapoff -a 2>/dev/null || true
+# -----------------------------
+# Time + keymap + networking
+# -----------------------------
+loadkeys "$KEYMAP" || true
+timedatectl set-ntp true
 
-  # Zap signatures and partition table
-  wipefs -af "${DISK}"
-  sgdisk --zap-all "${DISK}"
+# -----------------------------
+# Partitioning (GPT, UEFI)
+# Layout:
+#   1: EFI System Partition (FAT32)
+#   2: Linux root (ext4)
+#   optional: swap
+# -----------------------------
+wipefs -a "$DISK"
+sgdisk --zap-all "$DISK"
 
-  # Create partitions:
-  # 1) EFI
-  # 2) (optional) swap
-  # 3) root
-  if [[ "${SWAP_SIZE}" != "0" ]]; then
-    sgdisk -n 1:0:+${EFI_SIZE} -t 1:ef00 -c 1:"EFI" "${DISK}"
-    sgdisk -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"SWAP" "${DISK}"
-    sgdisk -n 3:0:0          -t 3:8300 -c 3:"ROOT" "${DISK}"
-  else
-    sgdisk -n 1:0:+${EFI_SIZE} -t 1:ef00 -c 1:"EFI" "${DISK}"
-    sgdisk -n 2:0:0            -t 2:8300 -c 2:"ROOT" "${DISK}"
-  fi
+# Create partitions
+# EFI
+sgdisk -n 1:0:+${EFI_SIZE} -t 1:ef00 -c 1:"EFI System" "$DISK"
 
-  partprobe "${DISK}"
-  sleep 1
-}
+if [[ "$SWAP_SIZE" != "0" ]]; then
+  # swap
+  sgdisk -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"Linux swap" "$DISK"
+  # root
+  sgdisk -n 3:0:0 -t 3:8300 -c 3:"Linux root" "$DISK"
+  EFI_PART="${DISK}p1"
+  SWAP_PART="${DISK}p2"
+  ROOT_PART="${DISK}p3"
+else
+  # root
+  sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux root" "$DISK"
+  EFI_PART="${DISK}p1"
+  ROOT_PART="${DISK}p2"
+fi
 
-set_part_vars() {
-  # Handles nvme0n1pX vs sdaX naming
-  if [[ "${DISK}" =~ nvme|mmcblk ]]; then
-    EFI="${DISK}p1"
-    if [[ "${SWAP_SIZE}" != "0" ]]; then
-      SWAP="${DISK}p2"
-      ROOT="${DISK}p3"
-    else
-      ROOT="${DISK}p2"
-    fi
-  else
-    EFI="${DISK}1"
-    if [[ "${SWAP_SIZE}" != "0" ]]; then
-      SWAP="${DISK}2"
-      ROOT="${DISK}3"
-    else
-      ROOT="${DISK}2"
-    fi
-  fi
-}
+# If disk is /dev/sda style, partitions are /dev/sda1 not /dev/sda p1
+if [[ "$DISK" =~ ^/dev/sd ]]; then
+  EFI_PART="${DISK}1"
+  [[ "$SWAP_SIZE" != "0" ]] && SWAP_PART="${DISK}2"
+  ROOT_PART="${DISK}$([[ "$SWAP_SIZE" != "0" ]] && echo 3 || echo 2)"
+fi
 
-format_and_mount() {
-  echo "Formatting..."
-  mkfs.fat -F32 "${EFI}"
-  mkfs.ext4 -F "${ROOT}"
+partprobe "$DISK"
+sleep 1
 
-  if [[ "${SWAP_SIZE}" != "0" ]]; then
-    mkswap "${SWAP}"
-    swapon "${SWAP}"
-  fi
+# -----------------------------
+# Filesystems
+# -----------------------------
+mkfs.fat -F32 "$EFI_PART"
+mkfs.ext4 -F "$ROOT_PART"
 
-  echo "Mounting..."
-  mount "${ROOT}" /mnt
-  mkdir -p /mnt/boot
-  mount "${EFI}" /mnt/boot
-}
+if [[ "${SWAP_SIZE}" != "0" ]]; then
+  mkswap "$SWAP_PART"
+  swapon "$SWAP_PART"
+fi
 
-install_base() {
-  echo "Installing base system..."
-  # Ensure time is correct for TLS
-  timedatectl set-ntp true
+# -----------------------------
+# Mounting
+# -----------------------------
+mount "$ROOT_PART" /mnt
+mkdir -p /mnt/boot
+mount "$EFI_PART" /mnt/boot
 
-  pacstrap -K /mnt "${PKGS[@]}"
+# -----------------------------
+# Install base system
+# -----------------------------
+pacstrap -K /mnt "${BASE_PKGS[@]}"
 
-  genfstab -U /mnt >> /mnt/etc/fstab
-}
+# fstab
+genfstab -U /mnt >> /mnt/etc/fstab
 
-configure_system_in_chroot() {
-  echo "Configuring system..."
-  arch-chroot /mnt /bin/bash -euo pipefail <<EOF
+# -----------------------------
+# Configure system (in chroot)
+# -----------------------------
+arch-chroot /mnt /bin/bash -euo pipefail <<EOF
 ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc
 
@@ -131,48 +127,42 @@ echo "LANG=${LOCALE}" > /etc/locale.conf
 echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 
 echo "${HOSTNAME}" > /etc/hostname
-cat > /etc/hosts <<HOSTS
+cat > /etc/hosts <<H
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
-HOSTS
+H
 
 systemctl enable NetworkManager
 
-# Sudo + user
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+# Create user (you can set passwords later or here)
 useradd -m -G wheel -s /bin/bash ${USERNAME}
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
+# Set root and user passwords (INSECURE to hardcode; will prompt)
 echo "Set root password:"
 passwd
-echo "Set password for ${USERNAME}:"
+echo "Set ${USERNAME} password:"
 passwd ${USERNAME}
 
-# Bootloader (GRUB UEFI)
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
+# Bootloader: systemd-boot (UEFI)
+bootctl install
+
+# Find UUID of root for loader entry
+ROOT_UUID=\$(blkid -s UUID -o value ${ROOT_PART})
+
+cat > /boot/loader/loader.conf <<L
+default arch.conf
+timeout 3
+editor  no
+L
+
+cat > /boot/loader/entries/arch.conf <<E
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=UUID=\${ROOT_UUID} rw
+E
 EOF
-}
 
-finish() {
-  echo "Done."
-  echo "You can reboot. If you want to be safe:"
-  echo "  umount -R /mnt"
-  echo "  swapoff -a"
-}
-
-main() {
-  need_root
-  check_live_env
-  confirm_disk
-
-  set_part_vars
-  wipe_and_partition_gpt_uefi
-  set_part_vars
-  format_and_mount
-  install_base
-  configure_system_in_chroot
-  finish
-}
-
-main "$@"
+echo "Install complete. You can reboot now."
