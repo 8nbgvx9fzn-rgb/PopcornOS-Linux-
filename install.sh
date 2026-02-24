@@ -4,7 +4,7 @@ set -euo pipefail
 # =========================
 # BLOCK: Configuration
 # =========================
-PACKAGES=(linux busybox kmod linux-firmware)
+PACKAGES=(linux busybox kmod linux-firmware util-linux)
 DISK="/dev/nvme0n1"   # whole disk
 LABEL="MINISHELL"
 
@@ -92,34 +92,43 @@ LABEL="MINISHELL"
   pacstrap -K /mnt "${PACKAGES[@]}"
 }
 # =========================
-# BLOCK: Build initramfs tree
-# ========================={
+# BLOCK: Post-install (depmod)
+# =========================
 {
-  echo "==> Building initramfs (busybox + /init that mounts root and switch_root)"
+  echo "==> Generating module dependency files (depmod)"
+  KVER="$(basename /mnt/usr/lib/modules/* | sort -V | tail -n1)"
+  /usr/bin/arch-chroot /mnt depmod -a "$KVER"
+}
+# =========================
+# BLOCK: Build initramfs tree
+# =========================
+{
+  echo "==> Building initramfs (busybox + kmod + blkid + /init)"
   INITRAMFS_DIR="/tmp/initramfs.$$"
   rm -rf "$INITRAMFS_DIR"
-  mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,newroot}
+  mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,newroot,usr/lib}
 
-  # Copy busybox from installed root (disk-backed)
+  # Busybox
   cp -a /mnt/usr/bin/busybox "$INITRAMFS_DIR/bin/busybox"
-
-  # Applets needed for boot + pivot
   for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep switch_root; do
     ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
   done
 
-  # If you expect NVMe/SATA modules (when not built-in), include them:
-  # NOTE: module paths must match the kernel you installed.
-  KVER="$(basename /mnt/usr/lib/modules/* | sort -V | tail -n1)"
-  mkdir -p "$INITRAMFS_DIR/usr/lib/modules/$KVER"
-  cp -a /mnt/usr/lib/modules/$KVER "$INITRAMFS_DIR/usr/lib/modules/"
+  # kmod tools (modprobe is the big one)
+  cp -a /mnt/usr/bin/kmod "$INITRAMFS_DIR/usr/bin/kmod"
+  ln -sf /usr/bin/kmod "$INITRAMFS_DIR/usr/bin/modprobe"
+  ln -sf /usr/bin/kmod "$INITRAMFS_DIR/usr/bin/insmod"
+  ln -sf /usr/bin/kmod "$INITRAMFS_DIR/usr/bin/lsmod"
 
-  # Minimal /init that:
-  # - mounts proc/sys/dev
-  # - waits for root= from cmdline
-  # - mounts root to /newroot
-  # - moves pseudo-fs
-  # - switch_root to /bin/sh (or /sbin/init if you install one)
+  # util-linux blkid (used by your PARTUUID resolver)
+  cp -a /mnt/usr/bin/blkid "$INITRAMFS_DIR/usr/bin/blkid"
+
+  # Kernel modules + dependency metadata
+  KVER="$(basename /mnt/usr/lib/modules/* | sort -V | tail -n1)"
+  mkdir -p "$INITRAMFS_DIR/usr/lib/modules"
+  cp -a /mnt/usr/lib/modules/"$KVER" "$INITRAMFS_DIR/usr/lib/modules/"
+
+  # Minimal /init (updated below)
   cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
 set -eu
@@ -128,10 +137,18 @@ mount -t proc  proc  /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
+# Ensure a usable console (fixes: "could not access tty: job control turned off")
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+[ -c /dev/tty ]     || mknod -m 666 /dev/tty c 5 0
+
+# Load storage + filesystem modules (adjust list if you know your platform)
+# If these are built-in, modprobe will just fail harmlessly.
+export PATH=/usr/bin:/bin:/sbin
+modprobe -a nvme nvme_core ahci ata_piix sd_mod scsi_mod usb_storage uas xhci_pci ext4 2>/dev/null || true
+
 cmdline="$(cat /proc/cmdline)"
 
 getarg() {
-  # getarg key -> prints value of key=VALUE from cmdline
   key="$1"
   echo "$cmdline" | tr ' ' '\n' | sed -n "s/^${key}=//p" | head -n1
 }
@@ -143,10 +160,9 @@ ROOTWAIT="$(echo "$cmdline" | tr ' ' '\n' | grep -qx 'rootwait' && echo 1 || ech
 [ -n "${ROOTSPEC:-}" ] || {
   echo "ERROR: no root= found on kernel cmdline"
   echo "cmdline: $cmdline"
-  exec /bin/sh
+  exec setsid /bin/sh -i </dev/console >/dev/console 2>&1
 }
 
-# Resolve PARTUUID=... to a block device
 resolve_root() {
   case "$ROOTSPEC" in
     PARTUUID=*)
@@ -179,43 +195,51 @@ while :; do
   ROOTDEV="$(resolve_root || true)"
   [ -n "${ROOTDEV:-}" ] && [ -b "$ROOTDEV" ] && break
   i=$((i+1))
-  if [ "$ROOTWAIT" = "1" ] && [ "$i" -lt 200 ]; then
+  if [ "$ROOTWAIT" = "1" ] && [ "$i" -lt 400 ]; then
     sleep 0.1
     continue
   fi
   echo "ERROR: could not resolve root device ($ROOTSPEC)"
-  exec /bin/sh
+  echo "Known block devices:"
+  ls -l /dev/nvme* /dev/sd* /dev/mmcblk* 2>/dev/null || true
+  exec setsid /bin/sh -i </dev/console >/dev/console 2>&1
 done
 
 mkdir -p /newroot
 if [ -n "${FSTYPE:-}" ]; then
-  mount -t "$FSTYPE" -o ro "$ROOTDEV" /newroot || mount -t "$FSTYPE" "$ROOTDEV" /newroot
+  mount -t "$FSTYPE" "$ROOTDEV" /newroot
 else
-  mount -o ro "$ROOTDEV" /newroot || mount "$ROOTDEV" /newroot
+  mount "$ROOTDEV" /newroot
 fi
 
-# Move pseudo-filesystems into new root
 mkdir -p /newroot/{proc,sys,dev,run}
 mount --move /proc /newroot/proc
 mount --move /sys  /newroot/sys
 mount --move /dev  /newroot/dev
 mount --move /run  /newroot/run 2>/dev/null || true
 
-echo "==> switch_root to disk root ($ROOTDEV)"
 exec switch_root /newroot /bin/sh
 INIT
 
   chmod +x "$INITRAMFS_DIR/init"
 }
 # =========================
-# BLOCK: Copy busybox shared libs
+# BLOCK: Copy shared libs
 # =========================
 {
-  echo "==> Copying shared libs for busybox into initramfs"
-  mapfile -t libs < <(ldd /mnt/usr/bin/busybox | awk '
-    $2 == "=>" { print $3 }
-    $1 ~ /^\// { print $1 }
-  ' | sort -u)
+  echo "==> Copying shared libs into initramfs"
+
+  # Collect ELFs we added
+  ELFS=(/mnt/usr/bin/busybox /mnt/usr/bin/kmod /mnt/usr/bin/blkid)
+
+  mapfile -t libs < <(
+    for e in "${ELFS[@]}"; do
+      ldd "$e" 2>/dev/null | awk '
+        $2 == "=>" { print $3 }
+        $1 ~ /^\// { print $1 }
+      '
+    done | sort -u
+  )
 
   for f in "${libs[@]}"; do
     [[ -f "$f" ]] || continue
