@@ -201,7 +201,29 @@ while :; do
   fi
   echo "ERROR: could not resolve root device ($ROOTSPEC)"
   echo "Known block devices:"
-  ls -l /dev/nvme* /dev/sd* /dev/mmcblk* 2>/dev/null || true
+echo "Known block devices (from /sys/block):"
+for b in /sys/block/*; do
+  [ -e "$b" ] || continue
+  name="$(basename "$b")"
+  # Skip pseudo devices
+  case "$name" in
+    loop*|ram*|fd*) continue ;;
+  esac
+
+  echo " - /dev/$name"
+
+  # List partitions, if any
+  for p in "$b"/"$name"*; do
+    [ -e "$p" ] || continue
+    part="$(basename "$p")"
+    [ "$part" = "$name" ] && continue
+    echo "    - /dev/$part"
+  done
+done
+
+echo
+echo "Raw /dev nodes (block only):"
+find /dev -maxdepth 2 -type b 2>/dev/null | sort || true
   exec setsid /bin/sh -i </dev/console >/dev/console 2>&1
 done
 
@@ -304,5 +326,5 @@ ENTRY
   rm -rf "$INITRAMFS_DIR"
 
   echo
-  echo "==> Linux install complete: Reboot when ready."
+  echo "==> Linux install complete: reboot when ready."
 }
