@@ -33,9 +33,14 @@ LABEL="MINISHELL"
 # BLOCK: Partition disk
 # =========================
 {
-  echo "==> Partitioning disk (GPT: EFI only)"
+  echo "==> Partitioning disk (GPT: EFI + ROOT)"
   sgdisk --zap-all "$DISK"
+
+  # 1) EFI
   sgdisk -n 1:0:+1024M -t 1:ef00 -c 1:"EFI" "$DISK"
+
+  # 2) ROOT (rest of disk)
+  sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK"
 
   sync
   partprobe "$DISK" || true
@@ -43,176 +48,182 @@ LABEL="MINISHELL"
 
   if [[ "$DISK" == /dev/nvme* ]]; then
     EFI="${DISK}p1"
+    ROOT="${DISK}p2"
   else
     EFI="${DISK}1"
+    ROOT="${DISK}2"
   fi
 }
-
 # =========================
 # BLOCK: Wait for partition
 # =========================
 {
-  echo "==> Waiting for EFI partition: $EFI"
-  for i in {1..20}; do
-    [[ -b "$EFI" ]] && break
+  echo "==> Waiting for partitions: $EFI , $ROOT"
+  for i in {1..50}; do
+    [[ -b "$EFI" && -b "$ROOT" ]] && break
     sleep 0.2
     udevadm settle
   done
-  [[ -b "$EFI" ]] || { echo "ERROR: partition not found"; lsblk; exit 1; }
+  [[ -b "$EFI" && -b "$ROOT" ]] || { echo "ERROR: partitions not found"; lsblk; exit 1; }
 }
-
 # =========================
 # BLOCK: Format + mount EFI
 # =========================
 {
-  echo "==> Formatting + mounting EFI (FAT32)"
+  echo "==> Formatting filesystems"
   mkfs.fat -F32 -n EFI "$EFI"
-  mount "$EFI" /mnt
-  mkdir -p /mnt/EFI/Linux
-  mkdir -p /mnt/loader/entries
-}
+  mkfs.ext4 -F -L ROOT "$ROOT"
 
+  echo "==> Mounting ROOT -> /mnt"
+  mount "$ROOT" /mnt
+
+  echo "==> Mounting EFI -> /mnt/boot"
+  mkdir -p /mnt/boot
+  mount "$EFI" /mnt/boot
+
+  mkdir -p /mnt/boot/EFI/Linux
+  mkdir -p /mnt/boot/loader/entries
+}
 # =========================
 # BLOCK: Stage root (pacstrap)
 # =========================
 {
-  # We'll use a temporary staging root to install packages and build initramfs.
-  STAGE="/tmp/stage"
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE"
-  pacstrap -K "$STAGE" "${PACKAGES[@]}"
+  echo "==> Installing packages to disk root (/mnt)"
+  pacstrap -K /mnt "${PACKAGES[@]}"
 }
-
 # =========================
 # BLOCK: Build initramfs tree
-# =========================
+# ========================={
 {
-  echo "==> Building ultra-minimal initramfs (busybox + libs + /init)"
+  echo "==> Building initramfs (busybox + /init that mounts root and switch_root)"
   INITRAMFS_DIR="/tmp/initramfs.$$"
   rm -rf "$INITRAMFS_DIR"
-  mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,root}
+  mkdir -p "$INITRAMFS_DIR"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,lib,lib64,run,tmp,newroot}
 
-  # Copy busybox
-  cp -a "$STAGE/usr/bin/busybox" "$INITRAMFS_DIR/bin/busybox"
+  # Copy busybox from installed root (disk-backed)
+  cp -a /mnt/usr/bin/busybox "$INITRAMFS_DIR/bin/busybox"
 
-  # Create applet symlinks we care about (add more if you want)
-  for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep; do
+  # Applets needed for boot + pivot
+  for a in sh mount umount cat echo ls dmesg mkdir mknod uname sleep switch_root; do
     ln -sf /bin/busybox "$INITRAMFS_DIR/bin/$a"
   done
 
-  # Minimal /init: mount pseudo-filesystems and drop to shell
+  # If you expect NVMe/SATA modules (when not built-in), include them:
+  # NOTE: module paths must match the kernel you installed.
+  KVER="$(basename /mnt/usr/lib/modules/* | sort -V | tail -n1)"
+  mkdir -p "$INITRAMFS_DIR/usr/lib/modules/$KVER"
+  cp -a /mnt/usr/lib/modules/$KVER "$INITRAMFS_DIR/usr/lib/modules/"
+
+  # Minimal /init that:
+  # - mounts proc/sys/dev
+  # - waits for root= from cmdline
+  # - mounts root to /newroot
+  # - moves pseudo-fs
+  # - switch_root to /bin/sh (or /sbin/init if you install one)
   cat > "$INITRAMFS_DIR/init" <<'INIT'
 #!/bin/sh
 set -eu
 
-# Send output to the real console
-exec >/dev/console 2>&1
-
-echo ""
-echo "=== minishell initramfs debug ==="
-
-# Mount the basics
-mkdir -p /proc /sys /dev /run
-mount -t proc  proc /proc 2>/dev/null || true
-mount -t sysfs sys /sys 2>/dev/null || true
+mount -t proc  proc  /proc
+mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
-echo ""
-echo "[cmdline]"
-cat /proc/cmdline 2>/dev/null || true
+cmdline="$(cat /proc/cmdline)"
 
-echo ""
-echo "[block majors from /proc/devices]"
-# Print from 'Block devices:' down, busybox/awk-safe
-awk 'p{print} /^Block devices:/{p=1; print}' /proc/devices 2>/dev/null || true
-
-echo ""
-echo "[/sys/class/block listing]"
-ls -l /sys/class/block 2>/dev/null || true
-
-echo ""
-echo "[PCI devices: class vendor device BDF]"
-# Print all PCI devices with class/vendor/device IDs
-for d in /sys/bus/pci/devices/*; do
-  cls="$(cat "$d/class" 2>/dev/null || echo "?")"
-  ven="$(cat "$d/vendor" 2>/dev/null || echo "?")"
-  dev="$(cat "$d/device" 2>/dev/null || echo "?")"
-  echo "$cls $ven $dev $(basename "$d")"
-done | sort || true
-
-echo ""
-echo "[Mass storage controllers (class 0x01xxxx)]"
-found=0
-for d in /sys/bus/pci/devices/*; do
-  cls="$(cat "$d/class" 2>/dev/null || echo "")"
-  case "$cls" in
-    0x01*)
-      found=1
-      ven="$(cat "$d/vendor" 2>/dev/null || echo "?")"
-      dev="$(cat "$d/device" 2>/dev/null || echo "?")"
-      echo "$cls $ven $dev $d"
-      ;;
-  esac
-done
-[ "$found" -eq 0 ] && echo "(none found)"
-
-echo ""
-echo "[Try loading common storage modules if modprobe exists]"
-if command -v modprobe >/dev/null 2>&1; then
-  # Intel VMD/RST can hide NVMe behind VMD
-  modprobe vmd 2>/dev/null || true
-  # NVMe / SATA AHCI paths
-  modprobe nvme 2>/dev/null || true
-  modprobe ahci 2>/dev/null || true
-  # SCSI disk stack (often needed for SATA/USB)
-  modprobe scsi_mod 2>/dev/null || true
-  modprobe sd_mod 2>/dev/null || true
-  # VM path (harmless on bare metal)
-  modprobe virtio_pci 2>/dev/null || true
-  modprobe virtio_blk 2>/dev/null || true
-
-  sleep 1
-
-  echo ""
-  echo "[After modprobe: /sys/class/block]"
-  ls -l /sys/class/block 2>/dev/null || true
-
-  echo ""
-  echo "[After modprobe: dmesg tail]"
-  dmesg | tail -200 2>/dev/null || true
-else
-  echo "modprobe not present in initramfs (no module loading possible)."
-fi
-
-echo ""
-echo "=== dropping to shell ==="
-exec sh
-INIT
-  chmod +x "$INITRAMFS_DIR/init"
+getarg() {
+  # getarg key -> prints value of key=VALUE from cmdline
+  key="$1"
+  echo "$cmdline" | tr ' ' '\n' | sed -n "s/^${key}=//p" | head -n1
 }
 
+ROOTSPEC="$(getarg root)"
+FSTYPE="$(getarg rootfstype)"
+ROOTWAIT="$(echo "$cmdline" | tr ' ' '\n' | grep -qx 'rootwait' && echo 1 || echo 0)"
+
+[ -n "${ROOTSPEC:-}" ] || {
+  echo "ERROR: no root= found on kernel cmdline"
+  echo "cmdline: $cmdline"
+  exec /bin/sh
+}
+
+# Resolve PARTUUID=... to a block device
+resolve_root() {
+  case "$ROOTSPEC" in
+    PARTUUID=*)
+      pu="${ROOTSPEC#PARTUUID=}"
+      for p in /dev/* /dev/*/*; do
+        [ -b "$p" ] || continue
+        [ "$(blkid -s PARTUUID -o value "$p" 2>/dev/null || true)" = "$pu" ] && { echo "$p"; return 0; }
+      done
+      return 1
+      ;;
+    UUID=*)
+      u="${ROOTSPEC#UUID=}"
+      for p in /dev/* /dev/*/*; do
+        [ -b "$p" ] || continue
+        [ "$(blkid -s UUID -o value "$p" 2>/dev/null || true)" = "$u" ] && { echo "$p"; return 0; }
+      done
+      return 1
+      ;;
+    /dev/*)
+      echo "$ROOTSPEC"; return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+i=0
+while :; do
+  ROOTDEV="$(resolve_root || true)"
+  [ -n "${ROOTDEV:-}" ] && [ -b "$ROOTDEV" ] && break
+  i=$((i+1))
+  if [ "$ROOTWAIT" = "1" ] && [ "$i" -lt 200 ]; then
+    sleep 0.1
+    continue
+  fi
+  echo "ERROR: could not resolve root device ($ROOTSPEC)"
+  exec /bin/sh
+done
+
+mkdir -p /newroot
+if [ -n "${FSTYPE:-}" ]; then
+  mount -t "$FSTYPE" -o ro "$ROOTDEV" /newroot || mount -t "$FSTYPE" "$ROOTDEV" /newroot
+else
+  mount -o ro "$ROOTDEV" /newroot || mount "$ROOTDEV" /newroot
+fi
+
+# Move pseudo-filesystems into new root
+mkdir -p /newroot/{proc,sys,dev,run}
+mount --move /proc /newroot/proc
+mount --move /sys  /newroot/sys
+mount --move /dev  /newroot/dev
+mount --move /run  /newroot/run 2>/dev/null || true
+
+echo "==> switch_root to disk root ($ROOTDEV)"
+exec switch_root /newroot /bin/sh
+INIT
+
+  chmod +x "$INITRAMFS_DIR/init"
+}
 # =========================
 # BLOCK: Copy busybox shared libs
 # =========================
 {
-  # Copy dynamic linker + libs needed by busybox (Arch busybox is usually dynamic)
-  # This is the part that makes the initramfs actually boot reliably.
-  echo "==> Copying shared libs for busybox"
-  mapfile -t libs < <(ldd "$STAGE/usr/bin/busybox" | awk '
+  echo "==> Copying shared libs for busybox into initramfs"
+  mapfile -t libs < <(ldd /mnt/usr/bin/busybox | awk '
     $2 == "=>" { print $3 }
     $1 ~ /^\// { print $1 }
   ' | sort -u)
 
   for f in "${libs[@]}"; do
     [[ -f "$f" ]] || continue
-    # Preserve lib64 vs lib layout
     dest="$INITRAMFS_DIR${f}"
     mkdir -p "$(dirname "$dest")"
     cp -a "$f" "$dest"
   done
 
-  # Also copy the dynamic loader explicitly if ldd didn’t list it plainly
-  # (common paths: /lib64/ld-linux-x86-64.so.2, /lib/ld-linux-*.so.*)
   for loader in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.*; do
     if [[ -f "$loader" ]]; then
       mkdir -p "$INITRAMFS_DIR$(dirname "$loader")"
@@ -220,7 +231,6 @@ INIT
     fi
   done
 }
-
 # =========================
 # BLOCK: Kernel + initramfs image
 # =========================
@@ -240,23 +250,24 @@ INIT
 # BLOCK: Bootloader config (systemd-boot)
 # =========================
 {
-  echo "==> Installing systemd-boot to EFI (bootloader only; no systemd in OS)"
-  bootctl --esp-path=/mnt install
+  echo "==> Installing systemd-boot to EFI"
+  bootctl --esp-path=/mnt/boot install
 
-  cat > /mnt/loader/loader.conf <<LOADER
+  ROOT_PARTUUID="$(blkid -s PARTUUID -o value "$ROOT")"
+
+  cat > /mnt/boot/loader/loader.conf <<LOADER
 default  minishell
 timeout  0
 editor   no
 LOADER
 
-  cat > /mnt/loader/entries/minishell.conf <<ENTRY
-title   $LABEL (kernel + busybox shell)
+  cat > /mnt/boot/loader/entries/minishell.conf <<ENTRY
+title   $LABEL (disk root + busybox)
 linux   /EFI/Linux/vmlinuz-linux
 initrd  /EFI/Linux/initramfs-minishell.img
-options quiet loglevel=3
+options root=PARTUUID=$ROOT_PARTUUID rootfstype=ext4 rootwait quiet loglevel=3
 ENTRY
 }
-
 # =========================
 # BLOCK: Finalize
 # =========================
@@ -266,5 +277,5 @@ ENTRY
   rm -rf "$INITRAMFS_DIR" "$STAGE"
 
   echo
-  echo "==> Install PopcornOS (debug): complete: Reboot when ready."
+  echo "==> Install complete. Reboot when ready."
 }
