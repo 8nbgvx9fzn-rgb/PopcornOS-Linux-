@@ -277,5 +277,5 @@ ENTRY
   rm -rf "$INITRAMFS_DIR" "$STAGE"
 
   echo
-  echo "==> Install complete. Reboot when ready."
+  echo "==> Install complete: Reboot when ready."
 }
