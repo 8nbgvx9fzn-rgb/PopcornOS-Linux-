@@ -236,16 +236,19 @@ INIT
 # =========================
 {
   echo "==> Copying kernel + building initramfs image"
-  # Kernel image from staging (Arch installs it in /boot within the staged root)
-  cp -a "$STAGE/boot/vmlinuz-linux" /mnt/EFI/Linux/vmlinuz-linux
 
-  # Create initramfs cpio (gzip for compatibility; you can use xz if you want)
+  # In v2, pacstrap installs to /mnt, so the kernel is here:
+  [[ -f /mnt/boot/vmlinuz-linux ]] || { echo "ERROR: kernel not found at /mnt/boot/vmlinuz-linux"; ls -l /mnt/boot || true; exit 1; }
+
+  # EFI is mounted at /mnt/boot, and systemd-boot expects entries relative to that ESP.
+  cp -a /mnt/boot/vmlinuz-linux /mnt/boot/EFI/Linux/vmlinuz-linux
+
+  # Create initramfs cpio (gzip for compatibility)
   (
     cd "$INITRAMFS_DIR"
     find . -print0 | cpio --null -ov --format=newc
-  ) | gzip -9 > /mnt/EFI/Linux/initramfs-minishell.img
+  ) | gzip -9 > /mnt/boot/EFI/Linux/initramfs-minishell.img
 }
-
 # =========================
 # BLOCK: Bootloader config (systemd-boot)
 # =========================
@@ -274,8 +277,8 @@ ENTRY
 {
   echo "==> Done. Unmounting."
   umount -R /mnt
-  rm -rf "$INITRAMFS_DIR" "$STAGE"
+  rm -rf "$INITRAMFS_DIR"
 
   echo
-  echo "==> Install complete: Reboot when ready."
+  echo "==> Linux install complete: Reboot when ready."
 }
