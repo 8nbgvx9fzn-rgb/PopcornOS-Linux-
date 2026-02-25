@@ -127,9 +127,10 @@ H
 
 systemctl enable NetworkManager
 
+# -----------------------------
 # Bootloader: systemd-boot (UEFI)
+# -----------------------------
 bootctl install
-
 ROOT_UUID=\$(blkid -s UUID -o value ${ROOT_PART})
 
 cat > /boot/loader/loader.conf <<L
@@ -144,6 +145,32 @@ linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
 options root=UUID=\${ROOT_UUID} rw
 E
+
+# -----------------------------
+# NO-LOGIN ROOT SHELL ON TTY1
+# -----------------------------
+cat > /etc/systemd/system/tty1-root-shell.service <<'S'
+[Unit]
+Description=Root shell on tty1 (no login)
+After=systemd-user-sessions.service
+After=getty.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agetty --noclear --skip-login --login-options "-f root" 115200 tty1 linux
+Restart=always
+
+[Install]
+WantedBy=getty.target
+S
+
+# Disable normal login prompt on tty1, enable root shell service
+systemctl disable getty@tty1.service
+systemctl enable tty1-root-shell.service
+
+# Optional: also disable other VTs if you want fewer logins hanging around
+# systemctl disable getty@tty2.service getty@tty3.service getty@tty4.service getty@tty5.service getty@tty6.service || true
+
 EOF
 
 echo "Install complete. Reboot when ready."
