@@ -116,8 +116,6 @@ cat > /etc/hosts <<H
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
-
-systemctl enable NetworkManager
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
 # -----------------------------
