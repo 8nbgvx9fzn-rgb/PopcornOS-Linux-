@@ -1,0 +1,13 @@
+#!/bin/sh
+# Mount essential pseudo‑filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+# If you need mdev instead of udev, set up hotplug here:
+# echo /sbin/mdev > /proc/sys/kernel/hotplug
+# /sbin/mdev -s
+
+# hand off to a shell or your application
+exec /bin/sh
+# Or replace /bin/sh with the path to your application to make it PID 1.
+INIT
