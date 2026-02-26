@@ -138,7 +138,7 @@ E
 # -----------------------------
 # Override initramfs /init from GitHub (minimal)
 # -----------------------------
-CUSTOM_INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init"
+CUSTOM_INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
 curl -fsSL "\$CUSTOM_INIT_URL" -o /usr/lib/initcpio/init
 chmod 0755 /usr/lib/initcpio/init
 
