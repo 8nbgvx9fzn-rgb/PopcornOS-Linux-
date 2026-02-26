@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 # -----------------------------
 # HARD-CODED TARGETS (edit me)
 # -----------------------------
@@ -14,7 +13,6 @@ EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
 
 BASE_PKGS=(linux linux-firmware busybox)
-
 # -----------------------------
 # Safety / environment checks
 # -----------------------------
@@ -38,13 +36,11 @@ fi
 echo "About to WIPE and install Arch to: $DISK"
 lsblk "$DISK"
 sleep 2
-
 # -----------------------------
 # Basics
 # -----------------------------
 loadkeys "$KEYMAP" || true
 timedatectl set-ntp true
-
 # -----------------------------
 # Partitioning (GPT, UEFI)
 # -----------------------------
@@ -81,7 +77,6 @@ else
     ROOT_PART="${DISK}2"
   fi
 fi
-
 # -----------------------------
 # Filesystems
 # -----------------------------
@@ -92,20 +87,17 @@ if [[ "$SWAP_SIZE" != "0" ]]; then
   mkswap "$SWAP_PART"
   swapon "$SWAP_PART"
 fi
-
 # -----------------------------
 # Mounting
 # -----------------------------
 mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
 mount "$EFI_PART" /mnt/boot
-
 # -----------------------------
 # Install base system
 # -----------------------------
 pacstrap -K /mnt "${BASE_PKGS[@]}"
 genfstab -U /mnt >> /mnt/etc/fstab
-
 # -----------------------------
 # Configure system (chroot)
 # -----------------------------
@@ -126,7 +118,6 @@ cat > /etc/hosts <<H
 H
 
 systemctl enable NetworkManager
-
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
 # -----------------------------
@@ -147,29 +138,15 @@ options root=UUID=\${ROOT_UUID} rw
 E
 
 # -----------------------------
-# NO-LOGIN ROOT SHELL ON TTY1
+# Override initramfs /init from GitHub (minimal)
 # -----------------------------
-cat > /etc/systemd/system/tty1-root-shell.service <<'S'
-[Unit]
-Description=Root shell on tty1 (no login)
-After=systemd-user-sessions.service
-After=getty.target
+CUSTOM_INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init"
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/agetty --noclear --skip-login --login-options "-f root" 115200 tty1 linux
-Restart=always
+curl -fsSL "$CUSTOM_INIT_URL" -o /usr/lib/initcpio/init
+chmod 0755 /usr/lib/initcpio/init
 
-[Install]
-WantedBy=getty.target
-S
-
-# Disable normal login prompt on tty1, enable root shell service
-systemctl disable getty@tty1.service
-systemctl enable tty1-root-shell.service
-
-# Optional: also disable other VTs if you want fewer logins hanging around
-# systemctl disable getty@tty2.service getty@tty3.service getty@tty4.service getty@tty5.service getty@tty6.service || true
+# Rebuild initramfs so /init inside it is your script
+mkinitcpio -P
 
 EOF
 
