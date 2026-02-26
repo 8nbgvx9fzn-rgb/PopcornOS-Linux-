@@ -173,4 +173,4 @@ systemctl enable tty1-root-shell.service
 
 EOF
 
-echo "Install complete. Reboot when ready."
+echo "PopcornOS install complete. Reboot when ready."
