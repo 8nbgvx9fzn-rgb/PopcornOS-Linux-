@@ -13,7 +13,7 @@ KEYMAP="us"
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
 
-BASE_PKGS=(base linux linux-firmware networkmanager vim)
+BASE_PKGS=(linux linux-firmware busybox)
 
 # -----------------------------
 # Safety / environment checks
