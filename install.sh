@@ -150,4 +150,4 @@ mkinitcpio -P
 
 EOF
 
-echo "PopcornOS install complete. Reboot when ready."
+echo "PopcornOS(alpha) install complete. Reboot when ready."
