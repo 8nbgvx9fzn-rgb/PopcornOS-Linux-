@@ -132,9 +132,12 @@ arch-chroot /mnt /bin/bash -eo pipefail <<EOF
 H
 
     # Prepare a minimal /bin so that busybox and sh are available in the root
-    # filesystem (the default Arch install places busybox in /usr/bin).
+    # filesystem (the default Arch install places busybox in /usr/bin).  On a
+    # modern Arch system /bin is usually a symlink to /usr/bin, so copying the
+    # file onto itself will fail.  Instead, just ensure the directory exists
+    # and create symlinks pointing back to busybox in /usr/bin.
     mkdir -p /bin
-    cp -f /usr/bin/busybox /bin/busybox
+    ln -sf /usr/bin/busybox /bin/busybox
     ln -sf busybox /bin/sh
 
     # --- Minimal initramfs configuration ---
