@@ -139,7 +139,7 @@ E
 # Override initramfs /init from GitHub (minimal, nounset-safe)
 # -----------------------------
 
-# 1) Fetch your custom mkinitcpio init template (becomes /init inside initramfs)
+# 1) Fetch your custom mkinitcpio init template (this becomes /init inside initramfs)
 curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init" \
   -o /usr/lib/initcpio/init.new
 chmod 0755 /usr/lib/initcpio/init.new
@@ -155,22 +155,21 @@ head -n1 /usr/lib/initcpio/init | grep -q '^#!' || {
 # 3) Rebuild initramfs so /init inside it is your script
 mkinitcpio -P
 
-# 4) Verify init exists in the built initramfs and print its first lines
+# 4) Verify init exists in the built initramfs
 lsinitcpio -a /boot/initramfs-linux.img | grep -qx 'init' || {
   echo "ERROR: initramfs-linux.img does not contain 'init' entry" >&2
-  lsinitcpio -a /boot/initramfs-linux.img | head -n 80 >&2
+  lsinitcpio -a /boot/initramfs-linux.img | head -n 120 >&2
   exit 1
 }
 
+# 5) Extract /init and print it (proof)
 TMPD="$(mktemp -d)"
-trap 'rm -rf "$TMPD"' EXIT
-
-(
-  cd "$TMPD" || exit 1
-  lsinitcpio -x /boot/initramfs-linux.img init
-  echo "----- /init inside initramfs-linux.img (first 10 lines) -----" >&2
-  head -n 10 "$TMPD/init" >&2
-)
+cd "$TMPD"
+lsinitcpio -x /boot/initramfs-linux.img init
+echo "----- /init inside initramfs-linux.img (first 10 lines) -----" >&2
+head -n 10 "$TMPD/init" >&2
+cd /
+rm -rf "$TMPD"
 
 EOF
 
