@@ -238,4 +238,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Minimal Linux install complete. Reboot when ready."
+echo "Linux install complete. Reboot when ready."
