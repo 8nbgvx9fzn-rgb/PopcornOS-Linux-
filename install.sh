@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 # -----------------------------
 # HARD-CODED TARGETS (edit me)
 # -----------------------------
@@ -11,8 +10,9 @@ KEYMAP="us"
 INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
-
 BASE_PKGS=(linux linux-firmware busybox)
+
+set -euo pipefail
 # -----------------------------
 # Safety / environment checks
 # -----------------------------
