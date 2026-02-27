@@ -173,4 +173,4 @@ rm -rf "$TMPD"
 
 EOF
 
-echo "PopcornOS(alpha2) install complete. Reboot when ready."
+echo "PopcornOS(alpha3) install complete. Reboot when ready."
