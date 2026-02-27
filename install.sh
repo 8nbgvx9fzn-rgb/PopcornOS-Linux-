@@ -172,26 +172,31 @@ done
 
 if [ -z "$rootdev" ]; then
   echo "[tinyinit] ERROR: no root= on cmdline"
-  exec /usr/bin/busybox sh
+  exec /bin/busybox sh
 fi
 
 mkdir -p /newroot
 echo "[tinyinit] mounting root: $rootdev"
 mount -t ext4 -o rw "$rootdev" /newroot || {
   echo "[tinyinit] ERROR: mount failed"
-  exec /usr/bin/busybox sh
+  exec /bin/busybox sh
 }
 
 echo "[tinyinit] switch_root -> busybox sh"
-exec /usr/bin/busybox switch_root /newroot /usr/bin/busybox sh
+exec /bin/busybox switch_root /newroot /bin/busybox sh
 INIT
     chmod +x /etc/initcpio/tiny/init
 
     # Create a mkinitcpio hook to include busybox and our tiny init script.
+    # We install busybox into /bin/busybox inside the initramfs.  On an Arch
+    # system, /bin is a symlink to /usr/bin in the root filesystem, but in
+    # the initramfs this path is distinct.  Installing busybox to /bin
+    # ensures that our tiny init can reference /bin/busybox reliably without
+    # worrying about symlink behaviour.
     cat > /etc/initcpio/install/tinyinit <<'HOOK'
 build() {
-  # Copy busybox into the initramfs under /usr/bin so our tiny init can invoke it
-  add_binary /usr/bin/busybox /usr/bin/busybox
+  # Copy busybox into the initramfs under /bin so our tiny init can invoke it
+  add_binary /usr/bin/busybox /bin/busybox
   add_file /etc/initcpio/tiny/init /init
 }
 help() {
@@ -202,9 +207,13 @@ HELPEOF
 }
 HOOK
 
-    # Minimal mkinitcpio configuration: only our tinyinit hook is required.
+    # Minimal mkinitcpio configuration.  Include just the modules required
+    # to access the root filesystem on a NVMe drive formatted with ext4,
+    # alongside our tinyinit hook.  Without these modules, the kernel may
+    # not recognize the NVMe device or the ext4 filesystem before our
+    # init script runs, leading to a failure to mount the root partition.
     cat > /etc/mkinitcpio.conf <<'CONF'
-MODULES=()
+MODULES=(nvme nvme_core ext4)
 BINARIES=()
 FILES=()
 HOOKS=(tinyinit)
@@ -237,4 +246,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Minimal Linux install complete. Reboot when ready."
+echo "linux install complete. Reboot when ready."
