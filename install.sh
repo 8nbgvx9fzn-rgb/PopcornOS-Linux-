@@ -164,4 +164,4 @@ E
 
 EOF
 
-echo "install complete. Reboot when ready."
+echo "(v1) install complete. Reboot when ready."
