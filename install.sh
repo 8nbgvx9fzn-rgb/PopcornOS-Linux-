@@ -134,15 +134,15 @@ linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
 options root=UUID=\${ROOT_UUID} rw
 E
-
 # -----------------------------
 # Override initramfs /init from GitHub (minimal)
 # -----------------------------
 
-# 1) Fetch your custom mkinitcpio init template (becomes /init inside initramfs)
+# 1) Fetch your custom mkinitcpio init template (this becomes /init inside initramfs)
 curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init" \
-  -o /usr/lib/initcpio/init
-chmod 0755 /usr/lib/initcpio/init
+  -o /usr/lib/initcpio/init.new
+chmod 0755 /usr/lib/initcpio/init.new
+mv -f /usr/lib/initcpio/init.new /usr/lib/initcpio/init
 
 # 2) Sanity check: ensure it's actually a script (not HTML / 404)
 head -n1 /usr/lib/initcpio/init | grep -q '^#!' || {
@@ -154,10 +154,22 @@ head -n1 /usr/lib/initcpio/init | grep -q '^#!' || {
 # 3) Rebuild initramfs so /init inside it is your script
 mkinitcpio -P
 
-# 4) Optional: prove what /init inside the built initramfs actually is
-# (useful while iterating; remove later)
-bsdtar -xOf /boot/initramfs-linux.img init | head -n 5 >&2
+# 4) Verify the built initramfs actually contains /init and show its first lines
+lsinitcpio -a /boot/initramfs-linux.img | grep -qx 'init' || {
+  echo "ERROR: initramfs-linux.img does not contain 'init' entry" >&2
+  lsinitcpio -a /boot/initramfs-linux.img | head -n 50 >&2
+  exit 1
+}
+
+_tmpd="$(mktemp -d)"
+(
+  cd "$_tmpd"
+  lsinitcpio -x /boot/initramfs-linux.img init
+  echo "----- /init inside initramfs-linux.img (first 10 lines) -----" >&2
+  head -n 10 "$_tmpd/init" >&2
+)
+rm -rf "$_tmpd"
 
 EOF
 
-echo "PopcornOS(alpha1) install complete. Reboot when ready."
+echo "PopcornOS(alpha2) install complete. Reboot when ready."
