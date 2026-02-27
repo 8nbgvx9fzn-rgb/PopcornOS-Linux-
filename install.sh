@@ -116,23 +116,45 @@ cat > /etc/hosts <<H
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
-
 # -----------------------------
-# Override initramfs /init globally (mkinitcpio template)
+# Replace initramfs /init globally using a custom /init from GitHub
 # -----------------------------
 INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
+TMP_INIT="/tmp/custom-init"
 
-install -d /usr/lib/initcpio
-if [[ -f /usr/lib/initcpio/init && ! -f /usr/lib/initcpio/init.stock ]]; then
-  cp -a /usr/lib/initcpio/init /usr/lib/initcpio/init.stock
+# Ensure curl exists in the live-ISO environment (archiso usually has it, but be defensive)
+if ! command -v curl >/dev/null 2>&1; then
+  pacman -Sy --noconfirm curl ca-certificates
 fi
 
-curl -fsSL "$INIT_URL" -o /usr/lib/initcpio/init
-chmod 0755 /usr/lib/initcpio/init
+# Download custom init in the live environment
+curl -fsSL "$INIT_URL" -o "$TMP_INIT"
+chmod 0755 "$TMP_INIT"
 
-# Rebuild initramfs so /boot/initramfs-linux.img contains the new /init
-mkinitcpio -P
+# Basic sanity checks (helps catch "single-line file" / formatting issues)
+if [[ ! -s "$TMP_INIT" ]]; then
+  echo "ERROR: downloaded init is empty: $INIT_URL" >&2
+  exit 1
+fi
+if [[ "$(head -n1 "$TMP_INIT")" != \#!* ]]; then
+  echo "ERROR: downloaded init missing shebang: $INIT_URL" >&2
+  exit 1
+fi
+if [[ "$(wc -l < "$TMP_INIT")" -lt 2 ]]; then
+  echo "ERROR: downloaded init looks like a single-line file; fix newlines in repo: $INIT_URL" >&2
+  exit 1
+fi
 
+# Backup the stock mkinitcpio init template once (after pacstrap it should exist)
+if [[ -f /mnt/usr/lib/initcpio/init && ! -f /mnt/usr/lib/initcpio/init.stock ]]; then
+  cp -a /mnt/usr/lib/initcpio/init /mnt/usr/lib/initcpio/init.stock
+fi
+
+# Install the custom init template into the target system
+install -Dm755 "$TMP_INIT" /mnt/usr/lib/initcpio/init
+
+# Rebuild initramfs so /boot/initramfs-linux*.img contains the new /init
+arch-chroot /mnt mkinitcpio -P
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
 # -----------------------------
