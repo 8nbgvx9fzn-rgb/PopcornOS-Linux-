@@ -160,4 +160,4 @@ bsdtar -xOf /boot/initramfs-linux.img init | head -n 5 >&2
 
 EOF
 
-echo "PopcornOS(alpha) install complete. Reboot when ready."
+echo "PopcornOS(alpha1) install complete. Reboot when ready."
