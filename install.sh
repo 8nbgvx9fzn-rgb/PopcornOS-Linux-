@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 # -----------------------------
 # HARD-CODED TARGETS (edit me)
 # -----------------------------
@@ -97,6 +97,13 @@ fi
 mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
 mount "$EFI_PART" /mnt/boot
+
+# Create a default vconsole.conf before pacstrap.
+# Recent versions of mkinitcpio complain if /etc/vconsole.conf is missing during
+# kernel package installation. Creating this file ahead of time avoids the
+# warning and ensures the initramfs is generated successfully.
+mkdir -p /mnt/etc
+echo "KEYMAP=${KEYMAP}" > /mnt/etc/vconsole.conf
 # -----------------------------
 # Install base system
 # -----------------------------
@@ -105,12 +112,15 @@ genfstab -U /mnt >> /mnt/etc/fstab
 # -----------------------------
 # Configure system (chroot)
 # -----------------------------
-arch-chroot /mnt /bin/bash -euo pipefail <<EOF
+arch-chroot /mnt /bin/bash -eo pipefail <<EOF
     # Set timezone, locale and hostname.  These are optional but
     # included here to mirror the original script’s behaviour.
     ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
     hwclock --systohc
-    sed -i 's/^#${LOCALE}/${LOCALE}/' /etc/locale.gen
+    # Un-comment the desired locale. Use double quotes to ensure the LOCALE
+    # variable is expanded by the outer script; single quotes would prevent
+    # variable expansion.
+    sed -i "s/^#${LOCALE}/${LOCALE}/" /etc/locale.gen
     locale-gen
     echo "LANG=${LOCALE}" > /etc/locale.conf
     echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
@@ -136,7 +146,10 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-set -eu
+# Use `set -e` only so that the script exits on failures but does not treat
+# references to unset variables as fatal. This avoids errors if the kernel
+# command line does not define certain parameters.
+set -e
 
 # Mount essential pseudo‑filesystems
 mount -t proc  proc /proc
