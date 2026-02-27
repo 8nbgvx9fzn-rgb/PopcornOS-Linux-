@@ -138,12 +138,25 @@ E
 # -----------------------------
 # Override initramfs /init from GitHub (minimal)
 # -----------------------------
-CUSTOM_INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
-curl -fsSL "\$CUSTOM_INIT_URL" -o /usr/lib/initcpio/init
+
+# 1) Fetch your custom mkinitcpio init template (becomes /init inside initramfs)
+curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init" \
+  -o /usr/lib/initcpio/init
 chmod 0755 /usr/lib/initcpio/init
 
-# Rebuild initramfs so /init inside it is your script
+# 2) Sanity check: ensure it's actually a script (not HTML / 404)
+head -n1 /usr/lib/initcpio/init | grep -q '^#!' || {
+  echo "ERROR: Downloaded init doesn't look like a script. First lines:" >&2
+  head -n5 /usr/lib/initcpio/init >&2
+  exit 1
+}
+
+# 3) Rebuild initramfs so /init inside it is your script
 mkinitcpio -P
+
+# 4) Optional: prove what /init inside the built initramfs actually is
+# (useful while iterating; remove later)
+bsdtar -xOf /boot/initramfs-linux.img init | head -n 5 >&2
 
 EOF
 
