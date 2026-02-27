@@ -157,6 +157,14 @@ mount -t proc  proc /proc
 mount -t sysfs sys  /sys
 mount -t devtmpfs dev /dev || true
 
+# Load critical storage and filesystem modules.  When kernel drivers are built as
+# modules (e.g. nvme, ext4), they are not loaded automatically in a
+# stripped‑down initramfs.  Explicitly loading them with modprobe ensures
+# that the root device and filesystem can be detected【68132403577045†L134-L140】.
+modprobe nvme 2>/dev/null || true
+modprobe nvme_core 2>/dev/null || true
+modprobe ext4 2>/dev/null || true
+
 # Use the kernel console for input/output
 exec </dev/console >/dev/console 2>&1
 
@@ -197,6 +205,10 @@ INIT
 build() {
   # Copy busybox into the initramfs under /bin so our tiny init can invoke it
   add_binary /usr/bin/busybox /bin/busybox
+  # Copy modprobe so the tiny init can load necessary modules.  Without this,
+  # kernel drivers built as modules (e.g. nvme and ext4) will not be loaded,
+  # and the system may fail to detect the root device or filesystem【68132403577045†L134-L140】.
+  add_binary /usr/bin/modprobe /usr/bin/modprobe
   add_file /etc/initcpio/tiny/init /init
 }
 help() {
@@ -246,4 +258,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "linux install complete. Reboot when ready."
+echo "Minimal Linux install complete. Reboot when ready."
