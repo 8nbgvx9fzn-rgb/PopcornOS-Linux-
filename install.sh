@@ -119,41 +119,29 @@ H
 # -----------------------------
 # Replace initramfs /init globally using a custom /init from GitHub
 # -----------------------------
-INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
 TMP_INIT="/tmp/custom-init"
 
-# Ensure curl exists in the live-ISO environment (archiso usually has it, but be defensive)
 if ! command -v curl >/dev/null 2>&1; then
   pacman -Sy --noconfirm curl ca-certificates
 fi
 
-# Download custom init in the live environment
 curl -fsSL "$INIT_URL" -o "$TMP_INIT"
 chmod 0755 "$TMP_INIT"
 
-# Basic sanity checks (helps catch "single-line file" / formatting issues)
-if [[ ! -s "$TMP_INIT" ]]; then
-  echo "ERROR: downloaded init is empty: $INIT_URL" >&2
-  exit 1
-fi
-if [[ "$(head -n1 "$TMP_INIT")" != \#!* ]]; then
-  echo "ERROR: downloaded init missing shebang: $INIT_URL" >&2
-  exit 1
-fi
-if [[ "$(wc -l < "$TMP_INIT")" -lt 2 ]]; then
-  echo "ERROR: downloaded init looks like a single-line file; fix newlines in repo: $INIT_URL" >&2
-  exit 1
-fi
+# sanity checks
+[[ -s "$TMP_INIT" ]] || { echo "ERROR: downloaded init is empty: $INIT_URL" >&2; exit 1; }
+[[ "$(head -n1 "$TMP_INIT")" == \#!* ]] || { echo "ERROR: downloaded init missing shebang: $INIT_URL" >&2; exit 1; }
+[[ "$(wc -l < "$TMP_INIT")" -ge 2 ]] || { echo "ERROR: downloaded init looks single-line; fix newlines in repo: $INIT_URL" >&2; exit 1; }
 
-# Backup the stock mkinitcpio init template once (after pacstrap it should exist)
+# backup stock mkinitcpio template once
 if [[ -f /mnt/usr/lib/initcpio/init && ! -f /mnt/usr/lib/initcpio/init.stock ]]; then
   cp -a /mnt/usr/lib/initcpio/init /mnt/usr/lib/initcpio/init.stock
 fi
 
-# Install the custom init template into the target system
+# install custom template into target system
 install -Dm755 "$TMP_INIT" /mnt/usr/lib/initcpio/init
 
-# Rebuild initramfs so /boot/initramfs-linux*.img contains the new /init
+# rebuild initramfs inside the target system
 arch-chroot /mnt mkinitcpio -P
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
@@ -176,4 +164,4 @@ E
 
 EOF
 
-echo "PopcornOS(alpha3) install complete. Reboot when ready."
+echo "install complete. Reboot when ready."
