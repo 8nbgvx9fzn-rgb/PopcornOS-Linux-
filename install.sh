@@ -8,7 +8,7 @@ HOSTNAME="archbox"
 TIMEZONE="America/Phoenix"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
-
+INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
 
