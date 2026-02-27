@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # -----------------------------
 # HARD-CODED TARGETS (edit me)
 # -----------------------------
@@ -7,12 +8,11 @@ HOSTNAME="archbox"
 TIMEZONE="America/Phoenix"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
-INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
+
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
-BASE_PKGS=(linux linux-firmware busybox)
 
-set -euo pipefail
+BASE_PKGS=(linux linux-firmware busybox)
 # -----------------------------
 # Safety / environment checks
 # -----------------------------
@@ -98,6 +98,20 @@ mount "$EFI_PART" /mnt/boot
 # -----------------------------
 pacstrap -K /mnt "${BASE_PKGS[@]}"
 genfstab -U /mnt >> /mnt/etc/fstab
+
+# Custom initramfs /init (download outside chroot; avoids heredoc + nounset issues)
+TMP_INIT="/tmp/custom-init"
+
+if ! command -v curl >/dev/null 2>&1; then
+  pacman -Sy --noconfirm curl ca-certificates
+fi
+
+curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init" -o "$TMP_INIT"
+chmod 0755 "$TMP_INIT"
+
+# install into target (mkinitcpio template path)
+install -Dm755 "$TMP_INIT" /mnt/usr/lib/initcpio/init
+
 # -----------------------------
 # Configure system (chroot)
 # -----------------------------
@@ -116,33 +130,6 @@ cat > /etc/hosts <<H
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
-# -----------------------------
-# Replace initramfs /init globally using a custom /init from GitHub
-# -----------------------------
-TMP_INIT="/tmp/custom-init"
-
-if ! command -v curl >/dev/null 2>&1; then
-  pacman -Sy --noconfirm curl ca-certificates
-fi
-
-curl -fsSL "$INIT_URL" -o "$TMP_INIT"
-chmod 0755 "$TMP_INIT"
-
-# sanity checks
-[[ -s "$TMP_INIT" ]] || { echo "ERROR: downloaded init is empty: $INIT_URL" >&2; exit 1; }
-[[ "$(head -n1 "$TMP_INIT")" == \#!* ]] || { echo "ERROR: downloaded init missing shebang: $INIT_URL" >&2; exit 1; }
-[[ "$(wc -l < "$TMP_INIT")" -ge 2 ]] || { echo "ERROR: downloaded init looks single-line; fix newlines in repo: $INIT_URL" >&2; exit 1; }
-
-# backup stock mkinitcpio template once
-if [[ -f /mnt/usr/lib/initcpio/init && ! -f /mnt/usr/lib/initcpio/init.stock ]]; then
-  cp -a /mnt/usr/lib/initcpio/init /mnt/usr/lib/initcpio/init.stock
-fi
-
-# install custom template into target system
-install -Dm755 "$TMP_INIT" /mnt/usr/lib/initcpio/init
-
-# rebuild initramfs inside the target system
-arch-chroot /mnt mkinitcpio -P
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
 # -----------------------------
@@ -164,4 +151,4 @@ E
 
 EOF
 
-echo "(v1) install complete. Reboot when ready."
+echo "PopcornOS install complete. Reboot when ready."
