@@ -116,6 +116,23 @@ cat > /etc/hosts <<H
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
+
+# -----------------------------
+# Override initramfs /init globally (mkinitcpio template)
+# -----------------------------
+INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
+
+install -d /usr/lib/initcpio
+if [[ -f /usr/lib/initcpio/init && ! -f /usr/lib/initcpio/init.stock ]]; then
+  cp -a /usr/lib/initcpio/init /usr/lib/initcpio/init.stock
+fi
+
+curl -fsSL "$INIT_URL" -o /usr/lib/initcpio/init
+chmod 0755 /usr/lib/initcpio/init
+
+# Rebuild initramfs so /boot/initramfs-linux.img contains the new /init
+mkinitcpio -P
+
 # -----------------------------
 # Bootloader: systemd-boot (UEFI)
 # -----------------------------
@@ -134,42 +151,6 @@ linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
 options root=UUID=\${ROOT_UUID} rw
 E
-
-# -----------------------------
-# Override initramfs /init from GitHub (minimal, nounset-safe)
-# -----------------------------
-
-# 1) Fetch your custom mkinitcpio init template (this becomes /init inside initramfs)
-curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/init" \
-  -o /usr/lib/initcpio/init.new
-chmod 0755 /usr/lib/initcpio/init.new
-mv -f /usr/lib/initcpio/init.new /usr/lib/initcpio/init
-
-# 2) Sanity check: ensure it's actually a script (not HTML / 404)
-head -n1 /usr/lib/initcpio/init | grep -q '^#!' || {
-  echo "ERROR: Downloaded init doesn't look like a script. First lines:" >&2
-  head -n5 /usr/lib/initcpio/init >&2
-  exit 1
-}
-
-# 3) Rebuild initramfs so /init inside it is your script
-mkinitcpio -P
-
-# 4) Verify init exists in the built initramfs
-lsinitcpio -a /boot/initramfs-linux.img | grep -qx 'init' || {
-  echo "ERROR: initramfs-linux.img does not contain 'init' entry" >&2
-  lsinitcpio -a /boot/initramfs-linux.img | head -n 120 >&2
-  exit 1
-}
-
-# 5) Extract /init and print it (proof)
-TMPD="$(mktemp -d)"
-cd "$TMPD"
-lsinitcpio -x /boot/initramfs-linux.img init
-echo "----- /init inside initramfs-linux.img (first 10 lines) -----" >&2
-head -n 10 "$TMPD/init" >&2
-cd /
-rm -rf "$TMPD"
 
 EOF
 
