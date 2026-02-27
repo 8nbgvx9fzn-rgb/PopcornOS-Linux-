@@ -131,14 +131,12 @@ arch-chroot /mnt /bin/bash -eo pipefail <<EOF
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
 
-    # Prepare a minimal /bin so that busybox and sh are available in the root
-    # filesystem (the default Arch install places busybox in /usr/bin).  On a
-    # modern Arch system /bin is usually a symlink to /usr/bin, so copying the
-    # file onto itself will fail.  Instead, just ensure the directory exists
-    # and create symlinks pointing back to busybox in /usr/bin.
-    mkdir -p /bin
-    ln -sf /usr/bin/busybox /bin/busybox
-    ln -sf busybox /bin/sh
+    # Ensure /bin/sh points to busybox.  We do not attempt to copy
+    # or link /bin/busybox because on modern Arch systems /bin is a
+    # symlink to /usr/bin and busybox already resides there.  Instead,
+    # just replace /bin/sh with a symlink to /usr/bin/busybox to
+    # guarantee a working shell in our minimal environment.
+    ln -sf /usr/bin/busybox /bin/sh
 
     # --- Minimal initramfs configuration ---
     # Create a tiny init script that mounts the necessary pseudo‑filesystems,
@@ -174,25 +172,26 @@ done
 
 if [ -z "$rootdev" ]; then
   echo "[tinyinit] ERROR: no root= on cmdline"
-  exec /bin/busybox sh
+  exec /usr/bin/busybox sh
 fi
 
 mkdir -p /newroot
 echo "[tinyinit] mounting root: $rootdev"
 mount -t ext4 -o rw "$rootdev" /newroot || {
   echo "[tinyinit] ERROR: mount failed"
-  exec /bin/busybox sh
+  exec /usr/bin/busybox sh
 }
 
 echo "[tinyinit] switch_root -> busybox sh"
-exec /bin/busybox switch_root /newroot /bin/busybox sh
+exec /usr/bin/busybox switch_root /newroot /usr/bin/busybox sh
 INIT
     chmod +x /etc/initcpio/tiny/init
 
     # Create a mkinitcpio hook to include busybox and our tiny init script.
     cat > /etc/initcpio/install/tinyinit <<'HOOK'
 build() {
-  add_binary /usr/bin/busybox /bin/busybox
+  # Copy busybox into the initramfs under /usr/bin so our tiny init can invoke it
+  add_binary /usr/bin/busybox /usr/bin/busybox
   add_file /etc/initcpio/tiny/init /init
 }
 help() {
@@ -238,4 +237,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Linux install complete. Reboot when ready."
+echo "Minimal Linux install complete. Reboot when ready."
