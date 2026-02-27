@@ -12,7 +12,11 @@ KEYMAP="us"
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
 
-BASE_PKGS=(linux linux-firmware busybox)
+# Install only the bare minimum packages required for a functioning kernel
+# along with busybox for the userland and systemd solely to provide
+# the `bootctl` utility used to install systemd‑boot.  We will not
+# actually run systemd as PID 1; instead a custom init is used.
+BASE_PKGS=(linux busybox systemd)
 # -----------------------------
 # Safety / environment checks
 # -----------------------------
@@ -98,57 +102,124 @@ mount "$EFI_PART" /mnt/boot
 # -----------------------------
 pacstrap -K /mnt "${BASE_PKGS[@]}"
 genfstab -U /mnt >> /mnt/etc/fstab
-
-# Custom initramfs /init (download outside chroot; avoids heredoc + nounset issues)
-TMP_INIT="/tmp/custom-init"
-
-if ! command -v curl >/dev/null 2>&1; then
-  pacman -Sy --noconfirm curl ca-certificates
-fi
-
-curl -fsSL "https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init" -o "$TMP_INIT"
-chmod 0755 "$TMP_INIT"
-
-# install into target (mkinitcpio template path)
-install -Dm755 "$TMP_INIT" /mnt/usr/lib/initcpio/init
-
 # -----------------------------
 # Configure system (chroot)
 # -----------------------------
 arch-chroot /mnt /bin/bash -euo pipefail <<EOF
-ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-hwclock --systohc
-
-sed -i 's/^#${LOCALE}/${LOCALE}/' /etc/locale.gen
-locale-gen
-echo "LANG=${LOCALE}" > /etc/locale.conf
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
-
-echo "${HOSTNAME}" > /etc/hostname
-cat > /etc/hosts <<H
+    # Set timezone, locale and hostname.  These are optional but
+    # included here to mirror the original script’s behaviour.
+    ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+    hwclock --systohc
+    sed -i 's/^#${LOCALE}/${LOCALE}/' /etc/locale.gen
+    locale-gen
+    echo "LANG=${LOCALE}" > /etc/locale.conf
+    echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+    echo "${HOSTNAME}" > /etc/hostname
+    cat > /etc/hosts <<H
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 H
-# -----------------------------
-# Bootloader: systemd-boot (UEFI)
-# -----------------------------
-bootctl install
-ROOT_UUID=\$(blkid -s UUID -o value ${ROOT_PART})
 
-cat > /boot/loader/loader.conf <<L
+    # Prepare a minimal /bin so that busybox and sh are available in the root
+    # filesystem (the default Arch install places busybox in /usr/bin).
+    mkdir -p /bin
+    cp -f /usr/bin/busybox /bin/busybox
+    ln -sf busybox /bin/sh
+
+    # --- Minimal initramfs configuration ---
+    # Create a tiny init script that mounts the necessary pseudo‑filesystems,
+    # parses the kernel command line for the root device, mounts it and
+    # finally executes a busybox shell.  This bypasses systemd or any other
+    # full‑featured init system.
+    mkdir -p /etc/initcpio/install /etc/initcpio/tiny
+
+    cat > /etc/initcpio/tiny/init <<'INIT'
+#!/bin/busybox sh
+set -eu
+
+# Mount essential pseudo‑filesystems
+mount -t proc  proc /proc
+mount -t sysfs sys  /sys
+mount -t devtmpfs dev /dev || true
+
+# Use the kernel console for input/output
+exec </dev/console >/dev/console 2>&1
+
+echo "[tinyinit] initramfs starting"
+
+# Extract the root device from the kernel command line (e.g. root=/dev/sda2)
+rootdev=""
+for x in $(cat /proc/cmdline); do
+  case "$x" in
+    root=*) rootdev="${x#root=}" ;;
+  esac
+done
+
+if [ -z "$rootdev" ]; then
+  echo "[tinyinit] ERROR: no root= on cmdline"
+  exec /bin/busybox sh
+fi
+
+mkdir -p /newroot
+echo "[tinyinit] mounting root: $rootdev"
+mount -t ext4 -o rw "$rootdev" /newroot || {
+  echo "[tinyinit] ERROR: mount failed"
+  exec /bin/busybox sh
+}
+
+echo "[tinyinit] switch_root -> busybox sh"
+exec /bin/busybox switch_root /newroot /bin/busybox sh
+INIT
+    chmod +x /etc/initcpio/tiny/init
+
+    # Create a mkinitcpio hook to include busybox and our tiny init script.
+    cat > /etc/initcpio/install/tinyinit <<'HOOK'
+build() {
+  add_binary /usr/bin/busybox /bin/busybox
+  add_file /etc/initcpio/tiny/init /init
+}
+help() {
+  cat <<HELPEOF
+Replaces the initramfs /init with a minimal busybox‑based init that mounts
+root= from the kernel command line and execs a busybox shell.
+HELPEOF
+}
+HOOK
+
+    # Minimal mkinitcpio configuration: only our tinyinit hook is required.
+    cat > /etc/mkinitcpio.conf <<'CONF'
+MODULES=()
+BINARIES=()
+FILES=()
+HOOKS=(tinyinit)
+CONF
+
+    # Rebuild the initramfs using mkinitcpio.  This will generate
+    # /boot/initramfs-linux.img that contains our custom /init.
+    mkinitcpio -P
+
+    # -----------------------------
+    # Bootloader: systemd‑boot (UEFI)
+    # -----------------------------
+    bootctl install
+
+    # Configure systemd‑boot to boot directly into our minimal environment.
+    # Use a hard‑coded device path for the root filesystem instead of relying
+    # on UUIDs.  The rootfstype option makes the tiny init script work
+    # seamlessly by telling the kernel what filesystem type to expect.
+    cat > /boot/loader/loader.conf <<L
 default arch.conf
-timeout 3
+timeout 0
 editor  no
 L
 
-cat > /boot/loader/entries/arch.conf <<E
-title   Arch Linux
+    cat > /boot/loader/entries/arch.conf <<E
+title   Minimal Linux (tinyinit)
 linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
-options root=UUID=\${ROOT_UUID} rw
+options root=${ROOT_PART} rw rootfstype=ext4
 E
-
 EOF
 
-echo "PopcornOS install complete. Reboot when ready."
+echo "Minimal Linux install complete. Reboot when ready."
