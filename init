@@ -1,13 +1,14 @@
-#!/bin/sh
-# Mount essential pseudo‑filesystems
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-mount -t devtmpfs dev /dev
-# If you need mdev instead of udev, set up hotplug here:
-# echo /sbin/mdev > /proc/sys/kernel/hotplug
-# /sbin/mdev -s
+#!/bin/busybox sh
+# Minimal init for initramfs using busybox
 
-# hand off to a shell or your application
-exec /bin/sh
-# Or replace /bin/sh with the path to your application to make it PID 1.
-INIT
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+# Mount essential pseudo-filesystems (use busybox applets explicitly)
+exec /bin/busybox sh -c '
+  /bin/busybox mount -t proc  proc /proc
+  /bin/busybox mount -t sysfs sys  /sys
+  /bin/busybox mount -t devtmpfs dev /dev
+
+  # hand off to a shell (PID 1)
+  exec /bin/busybox sh
+'
