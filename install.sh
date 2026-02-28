@@ -197,6 +197,16 @@ H
 # and causing a kernel panic.
 set -x
 
+# Ensure BusyBox applets are available under /bin.  BusyBox by itself provides
+# many commands (mount, modprobe, mkdir, etc.) as built‑in applets, but without
+# installing symlinks those commands will not be found by name.  We set the
+# PATH to /bin and then use `--install -s` to create symlinks for all applets
+# under /bin.  This means after this invocation, commands like `mount` and
+# `modprobe` will resolve correctly without needing to prefix them with
+# `/bin/busybox`.
+export PATH=/bin
+/bin/busybox --install -s /bin
+
 # Mount essential pseudo‑filesystems.  BusyBox does not automatically create
 # symlinks for its applets in this initramfs, so we must invoke them via
 # the busybox binary.  Without doing so, commands like `mount` or `mkdir`
@@ -335,4 +345,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "install complete. Reboot when ready."
+echo "Minimal Linux install complete. Reboot when ready."
