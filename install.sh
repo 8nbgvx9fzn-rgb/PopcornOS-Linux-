@@ -12,7 +12,7 @@ KEYMAP="us"
 # URL of the custom init script to fetch.  If you wish to override the default
 # minimal init used by this installer, set INIT_URL to point at the raw file
 # you want to use.  By default this points at a custom PopcornOS init on GitHub.
-INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
+INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/refs/heads/main/install.sh"
 
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
