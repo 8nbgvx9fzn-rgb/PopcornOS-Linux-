@@ -25,6 +25,49 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+## -----------------------------------------------------------------------------
+# Mirror and pacman download settings
+#
+# The default Arch installation images ship with a mirrorlist that lists
+# `fastly.mirror.pkgbuild.com` at the top. In constrained networks this server
+# can be extremely slow or unreachable, causing pacman/pacstrap to fail with
+# messages such as:
+#
+#   error: failed retrieving file 'pcre2-10.47-1-x86_64.pkg.tar.zst.sig' from
+#          fastly.mirror.pkgbuild.com : Operation too slow. Less than 1
+#          byte/sec transferred the last 10 seconds
+#
+# According to the ArchWiki's tip for installing packages on a poor connection,
+# you can use the `--disable-download-timeout` option (or its
+# `DisableDownloadTimeout` equivalent in pacman.conf) to avoid aborting
+# downloads when transfer speeds drop【746891820983840†L954-L966】.  It is also
+# advised to choose a reliable mirror rather than relying on the default
+# geo‑mirror.  The mirrorlist page recommends selecting a few preferred
+# mirrors near you and placing them at the top of the mirrorlist【933262178874733†L180-L211】.
+#
+# To avoid the `Operation too slow` errors, we override the mirrorlist here
+# with a known fast and up‑to‑date server and enable the
+# `DisableDownloadTimeout` option.  This happens before any packages are
+# downloaded so that both the host environment (pacstrap) and the installed
+# system share the same configuration.
+
+# Backup the current mirrorlist if it exists and override it with a single
+# fast mirror.  Using mirrors.edge.kernel.org avoids the fastly mirror entirely.
+# See the ArchWiki Mirrors article for more details【933262178874733†L180-L211】.
+if [[ -f /etc/pacman.d/mirrorlist ]]; then
+  cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup_$(date +%s)
+fi
+cat > /etc/pacman.d/mirrorlist <<'M'
+Server = https://mirrors.edge.kernel.org/archlinux/$repo/os/$arch
+M
+
+# Add DisableDownloadTimeout to pacman.conf to prevent low speed timeouts.  The
+# option is placed in the [options] section as recommended by the pacman
+# developers【746891820983840†L954-L966】.  Only add it once.
+if grep -q '^[[]options[]]' /etc/pacman.conf && ! grep -q '^DisableDownloadTimeout' /etc/pacman.conf; then
+  sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf
+fi
+
 if [[ ! -b "$DISK" ]]; then
   echo "Disk $DISK not found." >&2
   lsblk
