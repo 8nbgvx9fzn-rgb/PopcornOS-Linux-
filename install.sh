@@ -197,10 +197,13 @@ H
 # and causing a kernel panic.
 set -x
 
-# Mount essential pseudo‑filesystems
-mount -t proc  proc /proc
-mount -t sysfs sys  /sys
-mount -t devtmpfs dev /dev || true
+# Mount essential pseudo‑filesystems.  BusyBox does not automatically create
+# symlinks for its applets in this initramfs, so we must invoke them via
+# the busybox binary.  Without doing so, commands like `mount` or `mkdir`
+# will not be found and the script will exit, causing a kernel panic.
+/bin/busybox mount -t proc  proc /proc
+/bin/busybox mount -t sysfs sys  /sys
+/bin/busybox mount -t devtmpfs dev /dev || true
 
 # Load critical storage and filesystem modules.  When kernel drivers are built as
 # modules (e.g. nvme, ext4), they may not be loaded automatically in a
@@ -218,20 +221,25 @@ echo "[tinyinit] initramfs starting"
 
 # Extract the root device from the kernel command line (e.g. root=/dev/sda2)
 rootdev=""
-for x in $(cat /proc/cmdline); do
+fallback_root="@@FALLBACK_ROOT@@"
+for x in $(/bin/busybox cat /proc/cmdline); do
   case "$x" in
     root=*) rootdev="${x#root=}" ;;
   esac
 done
 
 if [ -z "$rootdev" ]; then
-  echo "[tinyinit] ERROR: no root= on cmdline"
-  exec /bin/busybox sh
+  # If no root= parameter is supplied on the kernel command line, fall back
+  # to the hard‑coded root device embedded at installation time.  This makes
+  # the system bootable even if the bootloader entry is missing the root= option.
+  rootdev="$fallback_root"
+  echo "[tinyinit] WARNING: no root= on cmdline; using fallback: $rootdev"
 fi
 
-mkdir -p /newroot
+# Create the mountpoint for the real root
+/bin/busybox mkdir -p /newroot
 echo "[tinyinit] mounting root: $rootdev"
-mount -t ext4 -o rw "$rootdev" /newroot || {
+/bin/busybox mount -t ext4 -o rw "$rootdev" /newroot || {
   echo "[tinyinit] ERROR: mount failed"
   exec /bin/busybox sh
 }
@@ -241,9 +249,6 @@ echo "[tinyinit] starting shell in new root"
 # be built into busybox on some systems, whereas chroot is more commonly
 # available.  Because modern Arch systems have /bin as a symlink to /usr/bin,
 # the BusyBox binary on the installed system resides at /usr/bin/busybox.
-# Therefore, we check that /newroot/usr/bin/busybox is present and executable
-# before attempting to chroot.  If it is missing, drop to an interactive
-# shell in the initramfs instead of exiting (which would trigger a panic).
 if [ ! -x /newroot/usr/bin/busybox ]; then
   echo "[tinyinit] ERROR: /usr/bin/busybox not found in new root"
   exec /bin/busybox sh
@@ -263,6 +268,13 @@ echo "[tinyinit] chroot session ended; dropping to initramfs shell"
 exec /bin/busybox sh
 INIT
     chmod +x /etc/initcpio/tiny/init
+
+    # Replace the fallback placeholder in the tiny init script with the actual
+    # root partition path.  The placeholder is used to prevent variable
+    # expansion inside the quoted heredoc above.  We perform this
+    # substitution here in the chroot environment so that the initramfs
+    # contains the correct fallback root device.
+    sed -i "s#@@FALLBACK_ROOT@@#${ROOT_PART}#g" /etc/initcpio/tiny/init
 
     # Create a mkinitcpio hook to include busybox and our tiny init script.
     # We install busybox into /bin/busybox inside the initramfs.  On an Arch
@@ -323,4 +335,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Linux install complete. Reboot when ready."
+echo "install complete. Reboot when ready."
