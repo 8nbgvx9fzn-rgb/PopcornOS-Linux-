@@ -9,6 +9,11 @@ TIMEZONE="America/Phoenix"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
 
+# URL of the custom init script to fetch.  If you wish to override the default
+# minimal init used by this installer, set INIT_URL to point at the raw file
+# you want to use.  By default this points at a custom PopcornOS init on GitHub.
+INIT_URL="https://raw.githubusercontent.com/8nbgvx9fzn-rgb/PopcornOS/main/init"
+
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
 
@@ -98,6 +103,21 @@ mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
 mount "$EFI_PART" /mnt/boot
 
+# Download the custom init script into the new system.  We fetch it
+# outside of the chroot to avoid needing curl inside the target environment.
+mkdir -p /mnt/etc/initcpio/tiny
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$INIT_URL" -o /mnt/etc/initcpio/tiny/init
+else
+  echo "Warning: curl not found, cannot download custom init from $INIT_URL" >&2
+  # Fallback to using busybox wget if available
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO /mnt/etc/initcpio/tiny/init "$INIT_URL"
+  fi
+fi
+# Ensure the downloaded init is executable.
+chmod +x /mnt/etc/initcpio/tiny/init
+
 # Create a default vconsole.conf before pacstrap.
 # Recent versions of mkinitcpio complain if /etc/vconsole.conf is missing during
 # kernel package installation. Creating this file ahead of time avoids the
@@ -139,61 +159,11 @@ H
     ln -sf /usr/bin/busybox /bin/sh
 
     # --- Minimal initramfs configuration ---
-    # Create a tiny init script that mounts the necessary pseudo‑filesystems,
-    # parses the kernel command line for the root device, mounts it and
-    # finally executes a busybox shell.  This bypasses systemd or any other
-    # full‑featured init system.
+    # Prepare directories for initramfs customization.  The init itself has
+    # already been downloaded outside of the chroot and placed under
+    # /etc/initcpio/tiny/init.  We ensure these directories exist within the
+    # chroot before generating the initramfs.
     mkdir -p /etc/initcpio/install /etc/initcpio/tiny
-
-    cat > /etc/initcpio/tiny/init <<'INIT'
-#!/bin/busybox sh
-# Use `set -e` only so that the script exits on failures but does not treat
-# references to unset variables as fatal. This avoids errors if the kernel
-# command line does not define certain parameters.
-set -e
-
-# Mount essential pseudo‑filesystems
-mount -t proc  proc /proc
-mount -t sysfs sys  /sys
-mount -t devtmpfs dev /dev || true
-
-# Load critical storage and filesystem modules.  When kernel drivers are built as
-# modules (e.g. nvme, ext4), they are not loaded automatically in a
-# stripped‑down initramfs.  Explicitly loading them with modprobe ensures
-# that the root device and filesystem can be detected【68132403577045†L134-L140】.
-modprobe nvme 2>/dev/null || true
-modprobe nvme_core 2>/dev/null || true
-modprobe ext4 2>/dev/null || true
-
-# Use the kernel console for input/output
-exec </dev/console >/dev/console 2>&1
-
-echo "[tinyinit] initramfs starting"
-
-# Extract the root device from the kernel command line (e.g. root=/dev/sda2)
-rootdev=""
-for x in $(cat /proc/cmdline); do
-  case "$x" in
-    root=*) rootdev="${x#root=}" ;;
-  esac
-done
-
-if [ -z "$rootdev" ]; then
-  echo "[tinyinit] ERROR: no root= on cmdline"
-  exec /bin/busybox sh
-fi
-
-mkdir -p /newroot
-echo "[tinyinit] mounting root: $rootdev"
-mount -t ext4 -o rw "$rootdev" /newroot || {
-  echo "[tinyinit] ERROR: mount failed"
-  exec /bin/busybox sh
-}
-
-echo "[tinyinit] switch_root -> busybox sh"
-exec /bin/busybox switch_root /newroot /bin/busybox sh
-INIT
-    chmod +x /etc/initcpio/tiny/init
 
     # Create a mkinitcpio hook to include busybox and our tiny init script.
     # We install busybox into /bin/busybox inside the initramfs.  On an Arch
