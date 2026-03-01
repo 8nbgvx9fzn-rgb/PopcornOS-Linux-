@@ -288,4 +288,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "install complete. Reboot when ready."
+echo "Reboot when ready."
