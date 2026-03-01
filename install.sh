@@ -11,11 +11,6 @@ KEYMAP="us"
 
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
-
-# Install only the bare minimum packages required for a functioning kernel
-# along with busybox for the userland and systemd solely to provide
-# the `bootctl` utility used to install systemd‑boot.  We will not
-# actually run systemd as PID 1; instead a custom init is used.
 BASE_PKGS=(linux busybox systemd)
 # -----------------------------
 # Safety / environment checks
@@ -25,35 +20,6 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-## -----------------------------------------------------------------------------
-# Mirror and pacman download settings
-#
-# The default Arch installation images ship with a mirrorlist that lists
-# `fastly.mirror.pkgbuild.com` at the top. In constrained networks this server
-# can be extremely slow or unreachable, causing pacman/pacstrap to fail with
-# messages such as:
-#
-#   error: failed retrieving file 'pcre2-10.47-1-x86_64.pkg.tar.zst.sig' from
-#          fastly.mirror.pkgbuild.com : Operation too slow. Less than 1
-#          byte/sec transferred the last 10 seconds
-#
-# According to the ArchWiki's tip for installing packages on a poor connection,
-# you can use the `--disable-download-timeout` option (or its
-# `DisableDownloadTimeout` equivalent in pacman.conf) to avoid aborting
-# downloads when transfer speeds drop【746891820983840†L954-L966】.  It is also
-# advised to choose a reliable mirror rather than relying on the default
-# geo‑mirror.  The mirrorlist page recommends selecting a few preferred
-# mirrors near you and placing them at the top of the mirrorlist【933262178874733†L180-L211】.
-#
-# To avoid the `Operation too slow` errors, we override the mirrorlist here
-# with a known fast and up‑to‑date server and enable the
-# `DisableDownloadTimeout` option.  This happens before any packages are
-# downloaded so that both the host environment (pacstrap) and the installed
-# system share the same configuration.
-
-# Backup the current mirrorlist if it exists and override it with a single
-# fast mirror.  Using mirrors.edge.kernel.org avoids the fastly mirror entirely.
-# See the ArchWiki Mirrors article for more details【933262178874733†L180-L211】.
 if [[ -f /etc/pacman.d/mirrorlist ]]; then
   cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup_$(date +%s)
 fi
@@ -190,42 +156,181 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
+# tinyinit: robust initramfs /init for mkinitcpio
+# - mounts proc/sys/dev/run
+# - loads storage/filesystem modules
+# - starts udev (if present) and coldplugs
+# - waits for root= to appear
+# - mounts root and switch_root into real userspace
 
 BB=/bin/busybox
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-fail() { echo "[tinyinit] ERROR: $*"; exec $BB sh; }
+log()  { echo "[tinyinit] $*"; }
+warn() { echo "[tinyinit] WARN: $*" >&2; }
+fail() { echo "[tinyinit] ERROR: $*" >&2; rescue; }
 
-# Make mountpoints
-$BB mkdir -p /proc /sys /dev /newroot || fail "mkdir mountpoints"
+rescue() {
+  log "Entering rescue shell (PID1)."
+  log "Try: dmesg | tail -200"
+  log "Try: ls -l /dev ; cat /proc/cmdline"
+  exec $BB sh
+}
 
-# Mount pseudo-filesystems
-$BB mount -t proc  proc /proc  || fail "mount /proc"
-$BB mount -t sysfs sys  /sys   || fail "mount /sys"
-$BB mount -t devtmpfs dev /dev || true
+# ---------- basic mounts ----------
+$BB mkdir -p /proc /sys /dev /run /newroot
 
-# Ensure console exists, then wire logs to it
+$BB mount -t proc  proc /proc   || fail "mount /proc"
+$BB mount -t sysfs sys  /sys    || fail "mount /sys"
+$BB mount -t devtmpfs dev /dev  || warn "devtmpfs mount failed"
+$BB mount -t tmpfs  tmp /run    || warn "tmpfs /run mount failed"
+
+# Ensure we have a console
 [ -c /dev/console ] || $BB mknod -m 600 /dev/console c 5 1
 [ -c /dev/null ]    || $BB mknod -m 666 /dev/null c 1 3
 exec </dev/console >/dev/console 2>&1
 
-echo "[tinyinit] starting..."
+log "Booting. cmdline: $($BB cat /proc/cmdline 2>/dev/null || echo '(unavailable)')"
 
-# Parse root= from cmdline
-rootdev=""
-for x in $($BB cat /proc/cmdline); do
-  case "$x" in
-    root=*) rootdev="${x#root=}" ;;
+# ---------- parse cmdline ----------
+ROOT=""
+ROOTFSTYPE=""
+ROOTFLAGS=""
+RW="rw"
+INIT="/sbin/init"
+ROOTWAIT=10
+
+for tok in $($BB cat /proc/cmdline 2>/dev/null); do
+  case "$tok" in
+    root=*)        ROOT="${tok#root=}" ;;
+    rootfstype=*)  ROOTFSTYPE="${tok#rootfstype=}" ;;
+    rootflags=*)   ROOTFLAGS="${tok#rootflags=}" ;;
+    ro)            RW="ro" ;;
+    rw)            RW="rw" ;;
+    init=*)        INIT="${tok#init=}" ;;
+    rootwait=*)    ROOTWAIT="${tok#rootwait=}" ;;
   esac
 done
 
-[ -n "$rootdev" ] || fail "no root= on cmdline"
-echo "[tinyinit] rootdev=$rootdev"
+[ -n "$ROOT" ] || fail "no root= on kernel cmdline"
 
-# Mount new root
-$BB mount -t ext4 -o rw "$rootdev" /newroot || fail "mount root"
+# ---------- helper: resolve root= to a /dev node ----------
+resolve_root() {
+  case "$ROOT" in
+    /dev/*) echo "$ROOT"; return 0 ;;
+    UUID=*)     echo "/dev/disk/by-uuid/${ROOT#UUID=}"; return 0 ;;
+    PARTUUID=*) echo "/dev/disk/by-partuuid/${ROOT#PARTUUID=}"; return 0 ;;
+    LABEL=*)    echo "/dev/disk/by-label/${ROOT#LABEL=}"; return 0 ;;
+  esac
+  # fallback: let mount try it as-is
+  echo "$ROOT"
+}
 
-echo "[tinyinit] switching root"
-exec $BB chroot /newroot /bin/sh
+ROOTDEV="$(resolve_root)"
+
+# ---------- module loading (best-effort) ----------
+# If modules are built-in, these will just fail harmlessly.
+# If modular, this is what makes /dev/nvme* appear *without* relying on udev.
+modprobe_try() {
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe "$1" 2>/dev/null || true
+  elif $BB grep -q "^$1 " /proc/modules 2>/dev/null; then
+    true
+  else
+    # busybox may have modprobe as an applet depending on build
+    $BB modprobe "$1" 2>/dev/null || true
+  fi
+}
+
+# storage stack (nvme + common alternatives)
+modprobe_try nvme
+modprobe_try nvme_core
+modprobe_try ahci
+modprobe_try sd_mod
+modprobe_try scsi_mod
+modprobe_try virtio_pci
+modprobe_try virtio_blk
+modprobe_try usb_storage
+modprobe_try uas
+
+# filesystems (add what you actually use)
+modprobe_try ext4
+modprobe_try vfat
+
+# ---------- start udev and coldplug (if available) ----------
+# mkinitcpio's "udev" hook usually provides these.
+UDEVD=""
+for c in /usr/lib/systemd/systemd-udevd /lib/systemd/systemd-udevd /sbin/udevd /usr/bin/udevd; do
+  [ -x "$c" ] && UDEVD="$c" && break
+done
+
+UDEVADM=""
+for c in /usr/bin/udevadm /bin/udevadm /sbin/udevadm; do
+  [ -x "$c" ] && UDEVADM="$c" && break
+done
+
+if [ -n "$UDEVD" ] && [ -n "$UDEVADM" ]; then
+  log "Starting udev: $UDEVD"
+  "$UDEVD" --daemon
+  "$UDEVADM" trigger --type=subsystems --action=add >/dev/null 2>&1 || true
+  "$UDEVADM" trigger --type=devices --action=add >/dev/null 2>&1 || true
+  "$UDEVADM" settle --timeout="${ROOTWAIT}" >/dev/null 2>&1 || true
+else
+  warn "udev not found in initramfs; device coldplug will be limited"
+fi
+
+# ---------- wait for root to exist ----------
+i=0
+while [ $i -lt "$ROOTWAIT" ]; do
+  # For UUID/PARTUUID paths, symlinks may appear slightly later.
+  if [ -e "$ROOTDEV" ] || [ -b "$ROOTDEV" ]; then
+    break
+  fi
+  # if the resolved symlink doesn't exist, try probing again (udev may have created links)
+  ROOTDEV="$(resolve_root)"
+  $BB sleep 1
+  i=$((i+1))
+done
+
+if ! [ -e "$ROOTDEV" ] && ! [ -b "$ROOTDEV" ]; then
+  warn "Root device not found after ${ROOTWAIT}s: $ROOTDEV"
+  warn "Known block devices:"
+  $BB ls -l /dev 2>/dev/null | $BB head -200 || true
+  fail "cannot find root device"
+fi
+
+# ---------- mount root ----------
+log "Mounting root: $ROOTDEV"
+
+MOUNTOPTS="$RW"
+[ -n "$ROOTFLAGS" ] && MOUNTOPTS="$MOUNTOPTS,$ROOTFLAGS"
+
+# If no fstype specified, let mount autodetect.
+if [ -n "$ROOTFSTYPE" ]; then
+  $BB mount -t "$ROOTFSTYPE" -o "$MOUNTOPTS" "$ROOTDEV" /newroot || fail "mount root failed"
+else
+  $BB mount -o "$MOUNTOPTS" "$ROOTDEV" /newroot || fail "mount root failed"
+fi
+
+# ---------- move mounts & switch_root ----------
+# Provide required dirs in new root
+$BB mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
+
+# Move our pseudo-filesystems into the real root
+$BB mount --move /proc /newroot/proc 2>/dev/null || true
+$BB mount --move /sys  /newroot/sys  2>/dev/null || true
+$BB mount --move /dev  /newroot/dev  2>/dev/null || true
+$BB mount --move /run  /newroot/run  2>/dev/null || true
+
+# Prefer switch_root over chroot for PID1 correctness
+if $BB test -x /newroot"$INIT"; then
+  log "switch_root to /newroot, exec $INIT"
+  exec $BB switch_root /newroot "$INIT"
+fi
+
+# If /sbin/init is missing, fall back to a shell
+warn "Requested init not found: $INIT ; falling back to /bin/sh"
+exec $BB switch_root /newroot /bin/sh
 INIT
     chmod +x /etc/initcpio/tiny/init
 
@@ -255,10 +360,10 @@ HOOK
     # not recognize the NVMe device or the ext4 filesystem before our
     # init script runs, leading to a failure to mount the root partition.
     cat > /etc/mkinitcpio.conf <<'CONF'
-MODULES=(nvme nvme_core ext4)
+MODULES=()
 BINARIES=()
 FILES=()
-HOOKS=(base udev modconf block filesystems tinyinit)
+HOOKS=(base udev autodetect modconf block filesystems tinyinit)
 CONF
 
     # Rebuild the initramfs using mkinitcpio.  This will generate
