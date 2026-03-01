@@ -190,13 +190,17 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-set -e
 
 BB=/bin/busybox
 
+fail() { echo "[tinyinit] ERROR: $*"; exec $BB sh; }
+
+# Make mountpoints
+$BB mkdir -p /proc /sys /dev /newroot || fail "mkdir mountpoints"
+
 # Mount pseudo-filesystems
-$BB mount -t proc  proc /proc
-$BB mount -t sysfs sys  /sys
+$BB mount -t proc  proc /proc  || fail "mount /proc"
+$BB mount -t sysfs sys  /sys   || fail "mount /sys"
 $BB mount -t devtmpfs dev /dev || true
 
 # Ensure console exists, then wire logs to it
@@ -214,21 +218,12 @@ for x in $($BB cat /proc/cmdline); do
   esac
 done
 
-if [ -z "$rootdev" ]; then
-  echo "[tinyinit] ERROR: no root= on cmdline"
-  exec $BB sh
-fi
-
+[ -n "$rootdev" ] || fail "no root= on cmdline"
 echo "[tinyinit] rootdev=$rootdev"
 
 # Mount new root
-$BB mkdir -p /newroot
-if ! $BB mount -t ext4 -o rw "$rootdev" /newroot; then
-  echo "[tinyinit] ERROR: failed to mount root"
-  exec $BB sh
-fi
+$BB mount -t ext4 -o rw "$rootdev" /newroot || fail "mount root"
 
-# Switch to it
 echo "[tinyinit] switching root"
 exec $BB chroot /newroot /bin/sh
 INIT
@@ -263,7 +258,7 @@ HOOK
 MODULES=(nvme nvme_core ext4)
 BINARIES=()
 FILES=()
-HOOKS=(tinyinit)
+HOOKS=(base udev modconf block filesystems tinyinit)
 CONF
 
     # Rebuild the initramfs using mkinitcpio.  This will generate
