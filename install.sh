@@ -157,156 +157,39 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-# Minimal initramfs /init for mkinitcpio with busybox
-# Fixes /dev not being a real devtmpfs inside the final userspace by:
-#  - mounting proc/sys/dev in initramfs
-#  - mounting real root at /newroot
-#  - moving /dev,/proc,/sys into /newroot
-#  - switch_root into /newroot
-
-set -eu
+# Minimal initramfs /init for switching into a real root at /newroot
 
 BB=/bin/busybox
 
 fail() {
-  echo "[-] initramfs: $*" >&2
-  echo "Dropping to shell..." >&2
+  echo "init: $*" > /dev/kmsg 2>/dev/null || true
+  echo "init: $*" >&2
   exec $BB sh
 }
 
-log() {
-  echo "[+] initramfs: $*" >&2
-}
+# Basic mounts for initramfs
+$BB mount -t devtmpfs devtmpfs /dev  || fail "mount /dev"
+$BB mkdir -p /proc /sys /newroot     || fail "mkdir"
+$BB mount -t proc proc /proc         || fail "mount /proc"
+$BB mount -t sysfs sys /sys          || fail "mount /sys"
 
-# --------------------------------------------------------------------
-# Basic early mounts
-# --------------------------------------------------------------------
-$BB mount -t devtmpfs devtmpfs /dev  || fail "mount devtmpfs on /dev"
-$BB mkdir -p /proc /sys /run /newroot
-$BB mount -t proc  proc  /proc        || fail "mount /proc"
-$BB mount -t sysfs sysfs /sys         || fail "mount /sys"
+# Root device must be provided by kernel cmdline: root=/dev/...
+rootdev="$($BB sed -n 's/.*\<root=\([^ ]*\).*/\1/p' /proc/cmdline)"
+[ -n "$rootdev" ] || fail "missing root= on kernel cmdline"
 
-# Optional: if you need /run
-# $BB mount -t tmpfs tmpfs /run || true
+# Mount real root
+$BB mount -o rw "$rootdev" /newroot  || fail "mount root $rootdev"
 
-# Provide minimal /dev nodes if needed (devtmpfs usually already has them)
-$BB mkdir -p /dev/pts
-$BB mount -t devpts devpts /dev/pts 2>/dev/null || true
+# Ensure mountpoints exist in new root
+$BB mkdir -p /newroot/dev /newroot/proc /newroot/sys || fail "mkdir newroot mountpoints"
 
-# --------------------------------------------------------------------
-# Device population / hotplug (optional but helps on some systems)
-# --------------------------------------------------------------------
-# If your busybox has mdev, this can help create nodes for hotplug events.
-# With devtmpfs, block devices should already appear once drivers are loaded.
-if $BB --list | $BB grep -qx mdev; then
-  log "enabling mdev hotplug (best-effort)"
-  echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
-  $BB mdev -s 2>/dev/null || true
-fi
+# Move mounts so they remain visible after the root switch
+$BB mount --move /dev  /newroot/dev  || fail "move /dev"
+$BB mount --move /proc /newroot/proc || fail "move /proc"
+$BB mount --move /sys  /newroot/sys  || fail "move /sys"
 
-# --------------------------------------------------------------------
-# Parse kernel cmdline for root=
-# Supports root=UUID=xxxx, root=/dev/..., root=LABEL=...
-# --------------------------------------------------------------------
-ROOTSPEC=""
-FSTYPE=""
-ROOTFLAGS="rw"
-
-CMDLINE="$($BB cat /proc/cmdline)"
-for arg in $CMDLINE; do
-  case "$arg" in
-    root=*)
-      ROOTSPEC="${arg#root=}"
-      ;;
-    rootfstype=*)
-      FSTYPE="${arg#rootfstype=}"
-      ;;
-    rootflags=*)
-      ROOTFLAGS="${arg#rootflags=}"
-      ;;
-  esac
-done
-
-[ -n "$ROOTSPEC" ] || fail "no root= found in kernel cmdline: $CMDLINE"
-
-# --------------------------------------------------------------------
-# Resolve ROOTSPEC to a block device path
-# --------------------------------------------------------------------
-resolve_rootdev() {
-  case "$ROOTSPEC" in
-    UUID=*)
-      uuid="${ROOTSPEC#UUID=}"
-      if [ -e "/dev/disk/by-uuid/$uuid" ]; then
-        echo "/dev/disk/by-uuid/$uuid"
-        return 0
-      fi
-      ;;
-    LABEL=*)
-      label="${ROOTSPEC#LABEL=}"
-      if [ -e "/dev/disk/by-label/$label" ]; then
-        echo "/dev/disk/by-label/$label"
-        return 0
-      fi
-      ;;
-    /dev/*)
-      if [ -b "$ROOTSPEC" ]; then
-        echo "$ROOTSPEC"
-        return 0
-      fi
-      ;;
-  esac
-  return 1
-}
-
-# Wait a bit for drivers/devices to show up (useful on slower storage init)
-log "waiting for root device ($ROOTSPEC) to appear..."
-i=0
-while :; do
-  if rootdev="$(resolve_rootdev)"; then
-    break
-  fi
-  i=$((i+1))
-  [ "$i" -le 50 ] || fail "root device not found: $ROOTSPEC"
-  # Refresh device nodes if mdev is present
-  if $BB --list | $BB grep -qx mdev; then
-    $BB mdev -s 2>/dev/null || true
-  fi
-  $BB sleep 0.1
-done
-
-log "root device is: $rootdev"
-
-# Default fstype if not provided (change if you only ever use ext4)
-[ -n "$FSTYPE" ] || FSTYPE="ext4"
-
-# --------------------------------------------------------------------
-# Mount the real root
-# --------------------------------------------------------------------
-log "mounting root: type=$FSTYPE flags=$ROOTFLAGS"
-$BB mount -t "$FSTYPE" -o "$ROOTFLAGS" "$rootdev" /newroot || fail "mount root"
-
-# Ensure these exist in the new root
-$BB mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
-
-# --------------------------------------------------------------------
-# Critical fix: move mounts into the new root before switching root
-# --------------------------------------------------------------------
-log "moving /dev /proc /sys into newroot"
-$BB mount --move /dev  /newroot/dev  || fail "mount --move /dev"
-$BB mount --move /proc /newroot/proc || fail "mount --move /proc"
-$BB mount --move /sys  /newroot/sys  || fail "mount --move /sys"
-# Optional if you mounted /run as tmpfs above:
-# $BB mount --move /run /newroot/run || true
-
-# --------------------------------------------------------------------
-# Switch to real root
-# --------------------------------------------------------------------
-log "switch_root to /newroot"
-exec $BB switch_root /newroot /bin/sh
-
-# If you want to boot “normally” instead of a shell, use one of these instead:
-# exec $BB switch_root /newroot /sbin/init
-# exec $BB switch_root /newroot /usr/lib/systemd/systemd
+# Switch to the real root and start userspace
+exec $BB switch_root /newroot /sbin/init || exec $BB switch_root /newroot /bin/sh
 INIT
     chmod +x /etc/initcpio/tiny/init
 
