@@ -11,6 +11,7 @@ KEYMAP="us"
 
 EFI_SIZE="512MiB"
 SWAP_SIZE="0"               # e.g. 8GiB, or "0" for none
+
 BASE_PKGS=(linux busybox systemd)
 # -----------------------------
 # Safety / environment checks
@@ -156,181 +157,156 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-# tinyinit: robust initramfs /init for mkinitcpio
-# - mounts proc/sys/dev/run
-# - loads storage/filesystem modules
-# - starts udev (if present) and coldplugs
-# - waits for root= to appear
-# - mounts root and switch_root into real userspace
+# Minimal initramfs /init for mkinitcpio with busybox
+# Fixes /dev not being a real devtmpfs inside the final userspace by:
+#  - mounting proc/sys/dev in initramfs
+#  - mounting real root at /newroot
+#  - moving /dev,/proc,/sys into /newroot
+#  - switch_root into /newroot
+
+set -eu
 
 BB=/bin/busybox
-PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-log()  { echo "[tinyinit] $*"; }
-warn() { echo "[tinyinit] WARN: $*" >&2; }
-fail() { echo "[tinyinit] ERROR: $*" >&2; rescue; }
-
-rescue() {
-  log "Entering rescue shell (PID1)."
-  log "Try: dmesg | tail -200"
-  log "Try: ls -l /dev ; cat /proc/cmdline"
+fail() {
+  echo "[-] initramfs: $*" >&2
+  echo "Dropping to shell..." >&2
   exec $BB sh
 }
 
-# ---------- basic mounts ----------
-$BB mkdir -p /proc /sys /dev /run /newroot
-
-$BB mount -t proc  proc /proc   || fail "mount /proc"
-$BB mount -t sysfs sys  /sys    || fail "mount /sys"
-$BB mount -t devtmpfs dev /dev  || warn "devtmpfs mount failed"
-$BB mount -t tmpfs  tmp /run    || warn "tmpfs /run mount failed"
-
-# Ensure we have a console
-[ -c /dev/console ] || $BB mknod -m 600 /dev/console c 5 1
-[ -c /dev/null ]    || $BB mknod -m 666 /dev/null c 1 3
-exec </dev/console >/dev/console 2>&1
-
-log "Booting. cmdline: $($BB cat /proc/cmdline 2>/dev/null || echo '(unavailable)')"
-
-# ---------- parse cmdline ----------
-ROOT=""
-ROOTFSTYPE=""
-ROOTFLAGS=""
-RW="rw"
-INIT="/sbin/init"
-ROOTWAIT=10
-
-for tok in $($BB cat /proc/cmdline 2>/dev/null); do
-  case "$tok" in
-    root=*)        ROOT="${tok#root=}" ;;
-    rootfstype=*)  ROOTFSTYPE="${tok#rootfstype=}" ;;
-    rootflags=*)   ROOTFLAGS="${tok#rootflags=}" ;;
-    ro)            RW="ro" ;;
-    rw)            RW="rw" ;;
-    init=*)        INIT="${tok#init=}" ;;
-    rootwait=*)    ROOTWAIT="${tok#rootwait=}" ;;
-  esac
-done
-
-[ -n "$ROOT" ] || fail "no root= on kernel cmdline"
-
-# ---------- helper: resolve root= to a /dev node ----------
-resolve_root() {
-  case "$ROOT" in
-    /dev/*) echo "$ROOT"; return 0 ;;
-    UUID=*)     echo "/dev/disk/by-uuid/${ROOT#UUID=}"; return 0 ;;
-    PARTUUID=*) echo "/dev/disk/by-partuuid/${ROOT#PARTUUID=}"; return 0 ;;
-    LABEL=*)    echo "/dev/disk/by-label/${ROOT#LABEL=}"; return 0 ;;
-  esac
-  # fallback: let mount try it as-is
-  echo "$ROOT"
+log() {
+  echo "[+] initramfs: $*" >&2
 }
 
-ROOTDEV="$(resolve_root)"
+# --------------------------------------------------------------------
+# Basic early mounts
+# --------------------------------------------------------------------
+$BB mount -t devtmpfs devtmpfs /dev  || fail "mount devtmpfs on /dev"
+$BB mkdir -p /proc /sys /run /newroot
+$BB mount -t proc  proc  /proc        || fail "mount /proc"
+$BB mount -t sysfs sysfs /sys         || fail "mount /sys"
 
-# ---------- module loading (best-effort) ----------
-# If modules are built-in, these will just fail harmlessly.
-# If modular, this is what makes /dev/nvme* appear *without* relying on udev.
-modprobe_try() {
-  if command -v modprobe >/dev/null 2>&1; then
-    modprobe "$1" 2>/dev/null || true
-  elif $BB grep -q "^$1 " /proc/modules 2>/dev/null; then
-    true
-  else
-    # busybox may have modprobe as an applet depending on build
-    $BB modprobe "$1" 2>/dev/null || true
-  fi
-}
+# Optional: if you need /run
+# $BB mount -t tmpfs tmpfs /run || true
 
-# storage stack (nvme + common alternatives)
-modprobe_try nvme
-modprobe_try nvme_core
-modprobe_try ahci
-modprobe_try sd_mod
-modprobe_try scsi_mod
-modprobe_try virtio_pci
-modprobe_try virtio_blk
-modprobe_try usb_storage
-modprobe_try uas
+# Provide minimal /dev nodes if needed (devtmpfs usually already has them)
+$BB mkdir -p /dev/pts
+$BB mount -t devpts devpts /dev/pts 2>/dev/null || true
 
-# filesystems (add what you actually use)
-modprobe_try ext4
-modprobe_try vfat
-
-# ---------- start udev and coldplug (if available) ----------
-# mkinitcpio's "udev" hook usually provides these.
-UDEVD=""
-for c in /usr/lib/systemd/systemd-udevd /lib/systemd/systemd-udevd /sbin/udevd /usr/bin/udevd; do
-  [ -x "$c" ] && UDEVD="$c" && break
-done
-
-UDEVADM=""
-for c in /usr/bin/udevadm /bin/udevadm /sbin/udevadm; do
-  [ -x "$c" ] && UDEVADM="$c" && break
-done
-
-if [ -n "$UDEVD" ] && [ -n "$UDEVADM" ]; then
-  log "Starting udev: $UDEVD"
-  "$UDEVD" --daemon
-  "$UDEVADM" trigger --type=subsystems --action=add >/dev/null 2>&1 || true
-  "$UDEVADM" trigger --type=devices --action=add >/dev/null 2>&1 || true
-  "$UDEVADM" settle --timeout="${ROOTWAIT}" >/dev/null 2>&1 || true
-else
-  warn "udev not found in initramfs; device coldplug will be limited"
+# --------------------------------------------------------------------
+# Device population / hotplug (optional but helps on some systems)
+# --------------------------------------------------------------------
+# If your busybox has mdev, this can help create nodes for hotplug events.
+# With devtmpfs, block devices should already appear once drivers are loaded.
+if $BB --list | $BB grep -qx mdev; then
+  log "enabling mdev hotplug (best-effort)"
+  echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+  $BB mdev -s 2>/dev/null || true
 fi
 
-# ---------- wait for root to exist ----------
+# --------------------------------------------------------------------
+# Parse kernel cmdline for root=
+# Supports root=UUID=xxxx, root=/dev/..., root=LABEL=...
+# --------------------------------------------------------------------
+ROOTSPEC=""
+FSTYPE=""
+ROOTFLAGS="rw"
+
+CMDLINE="$($BB cat /proc/cmdline)"
+for arg in $CMDLINE; do
+  case "$arg" in
+    root=*)
+      ROOTSPEC="${arg#root=}"
+      ;;
+    rootfstype=*)
+      FSTYPE="${arg#rootfstype=}"
+      ;;
+    rootflags=*)
+      ROOTFLAGS="${arg#rootflags=}"
+      ;;
+  esac
+done
+
+[ -n "$ROOTSPEC" ] || fail "no root= found in kernel cmdline: $CMDLINE"
+
+# --------------------------------------------------------------------
+# Resolve ROOTSPEC to a block device path
+# --------------------------------------------------------------------
+resolve_rootdev() {
+  case "$ROOTSPEC" in
+    UUID=*)
+      uuid="${ROOTSPEC#UUID=}"
+      if [ -e "/dev/disk/by-uuid/$uuid" ]; then
+        echo "/dev/disk/by-uuid/$uuid"
+        return 0
+      fi
+      ;;
+    LABEL=*)
+      label="${ROOTSPEC#LABEL=}"
+      if [ -e "/dev/disk/by-label/$label" ]; then
+        echo "/dev/disk/by-label/$label"
+        return 0
+      fi
+      ;;
+    /dev/*)
+      if [ -b "$ROOTSPEC" ]; then
+        echo "$ROOTSPEC"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# Wait a bit for drivers/devices to show up (useful on slower storage init)
+log "waiting for root device ($ROOTSPEC) to appear..."
 i=0
-while [ $i -lt "$ROOTWAIT" ]; do
-  # For UUID/PARTUUID paths, symlinks may appear slightly later.
-  if [ -e "$ROOTDEV" ] || [ -b "$ROOTDEV" ]; then
+while :; do
+  if rootdev="$(resolve_rootdev)"; then
     break
   fi
-  # if the resolved symlink doesn't exist, try probing again (udev may have created links)
-  ROOTDEV="$(resolve_root)"
-  $BB sleep 1
   i=$((i+1))
+  [ "$i" -le 50 ] || fail "root device not found: $ROOTSPEC"
+  # Refresh device nodes if mdev is present
+  if $BB --list | $BB grep -qx mdev; then
+    $BB mdev -s 2>/dev/null || true
+  fi
+  $BB sleep 0.1
 done
 
-if ! [ -e "$ROOTDEV" ] && ! [ -b "$ROOTDEV" ]; then
-  warn "Root device not found after ${ROOTWAIT}s: $ROOTDEV"
-  warn "Known block devices:"
-  $BB ls -l /dev 2>/dev/null | $BB head -200 || true
-  fail "cannot find root device"
-fi
+log "root device is: $rootdev"
 
-# ---------- mount root ----------
-log "Mounting root: $ROOTDEV"
+# Default fstype if not provided (change if you only ever use ext4)
+[ -n "$FSTYPE" ] || FSTYPE="ext4"
 
-MOUNTOPTS="$RW"
-[ -n "$ROOTFLAGS" ] && MOUNTOPTS="$MOUNTOPTS,$ROOTFLAGS"
+# --------------------------------------------------------------------
+# Mount the real root
+# --------------------------------------------------------------------
+log "mounting root: type=$FSTYPE flags=$ROOTFLAGS"
+$BB mount -t "$FSTYPE" -o "$ROOTFLAGS" "$rootdev" /newroot || fail "mount root"
 
-# If no fstype specified, let mount autodetect.
-if [ -n "$ROOTFSTYPE" ]; then
-  $BB mount -t "$ROOTFSTYPE" -o "$MOUNTOPTS" "$ROOTDEV" /newroot || fail "mount root failed"
-else
-  $BB mount -o "$MOUNTOPTS" "$ROOTDEV" /newroot || fail "mount root failed"
-fi
+# Ensure these exist in the new root
+$BB mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
 
-# ---------- move mounts & switch_root ----------
-# Provide required dirs in new root
-$BB mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
+# --------------------------------------------------------------------
+# Critical fix: move mounts into the new root before switching root
+# --------------------------------------------------------------------
+log "moving /dev /proc /sys into newroot"
+$BB mount --move /dev  /newroot/dev  || fail "mount --move /dev"
+$BB mount --move /proc /newroot/proc || fail "mount --move /proc"
+$BB mount --move /sys  /newroot/sys  || fail "mount --move /sys"
+# Optional if you mounted /run as tmpfs above:
+# $BB mount --move /run /newroot/run || true
 
-# Move our pseudo-filesystems into the real root
-$BB mount --move /proc /newroot/proc 2>/dev/null || true
-$BB mount --move /sys  /newroot/sys  2>/dev/null || true
-$BB mount --move /dev  /newroot/dev  2>/dev/null || true
-$BB mount --move /run  /newroot/run  2>/dev/null || true
-
-# Prefer switch_root over chroot for PID1 correctness
-if $BB test -x /newroot"$INIT"; then
-  log "switch_root to /newroot, exec $INIT"
-  exec $BB switch_root /newroot "$INIT"
-fi
-
-# If /sbin/init is missing, fall back to a shell
-warn "Requested init not found: $INIT ; falling back to /bin/sh"
+# --------------------------------------------------------------------
+# Switch to real root
+# --------------------------------------------------------------------
+log "switch_root to /newroot"
 exec $BB switch_root /newroot /bin/sh
+
+# If you want to boot “normally” instead of a shell, use one of these instead:
+# exec $BB switch_root /newroot /sbin/init
+# exec $BB switch_root /newroot /usr/lib/systemd/systemd
 INIT
     chmod +x /etc/initcpio/tiny/init
 
@@ -360,10 +336,10 @@ HOOK
     # not recognize the NVMe device or the ext4 filesystem before our
     # init script runs, leading to a failure to mount the root partition.
     cat > /etc/mkinitcpio.conf <<'CONF'
-MODULES=()
+MODULES=(nvme nvme_core ext4)
 BINARIES=()
 FILES=()
-HOOKS=(base udev autodetect modconf block filesystems tinyinit)
+HOOKS=(base udev modconf block filesystems tinyinit)
 CONF
 
     # Rebuild the initramfs using mkinitcpio.  This will generate
@@ -393,4 +369,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Reboot when ready."
+echo "Reboot!"
