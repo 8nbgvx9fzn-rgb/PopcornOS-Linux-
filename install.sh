@@ -157,7 +157,7 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-# Minimal initramfs /init for switching into a real root at /newroot
+# Minimal initramfs /init: mount real root, mount dev/proc/sys in it, switch_root
 
 BB=/bin/busybox
 
@@ -167,29 +167,31 @@ fail() {
   exec $BB sh
 }
 
-# Basic mounts for initramfs
-$BB mount -t devtmpfs devtmpfs /dev  || fail "mount /dev"
-$BB mkdir -p /proc /sys /newroot     || fail "mkdir"
-$BB mount -t proc proc /proc         || fail "mount /proc"
-$BB mount -t sysfs sys /sys          || fail "mount /sys"
+# Initramfs basics (enough to read cmdline and mount root)
+$BB mkdir -p /dev /proc /sys /newroot || fail "mkdir"
+$BB mount -t devtmpfs devtmpfs /dev   || fail "mount devtmpfs"
+$BB mount -t proc     proc     /proc  || fail "mount proc"
+$BB mount -t sysfs    sysfs    /sys   || fail "mount sysfs"
 
-# Root device must be provided by kernel cmdline: root=/dev/...
+# Root device: MUST be a real /dev node (not /dev/disk/by-uuid without udev)
 rootdev="$($BB sed -n 's/.*\<root=\([^ ]*\).*/\1/p' /proc/cmdline)"
 [ -n "$rootdev" ] || fail "missing root= on kernel cmdline"
 
 # Mount real root
-$BB mount -o rw "$rootdev" /newroot  || fail "mount root $rootdev"
+$BB mount -o rw "$rootdev" /newroot || fail "mount root $rootdev"
 
-# Ensure mountpoints exist in new root
-$BB mkdir -p /newroot/dev /newroot/proc /newroot/sys || fail "mkdir newroot mountpoints"
+# Mount kernel interfaces inside the *real* root (no --move needed)
+$BB mkdir -p /newroot/dev /newroot/proc /newroot/sys || fail "mkdir newroot mounts"
+$BB mount -t devtmpfs devtmpfs /newroot/dev          || fail "mount devtmpfs in newroot"
+$BB mount -t proc     proc     /newroot/proc         || fail "mount proc in newroot"
+$BB mount -t sysfs    sysfs    /newroot/sys          || fail "mount sysfs in newroot"
 
-# Move mounts so they remain visible after the root switch
-$BB mount --move /dev  /newroot/dev  || fail "move /dev"
-$BB mount --move /proc /newroot/proc || fail "move /proc"
-$BB mount --move /sys  /newroot/sys  || fail "move /sys"
-
-# Switch to the real root and start userspace
-exec $BB switch_root /newroot /sbin/init || exec $BB switch_root /newroot /bin/sh
+# Hand off
+if $BB switch_root /newroot /sbin/init; then
+  :
+else
+  exec $BB switch_root /newroot /bin/sh
+fi
 INIT
     chmod +x /etc/initcpio/tiny/init
 
