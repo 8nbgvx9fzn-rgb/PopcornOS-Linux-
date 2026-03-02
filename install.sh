@@ -254,4 +254,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Reboot!"
+echo "Reboot."
