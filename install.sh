@@ -157,8 +157,6 @@ H
 
     cat > /etc/initcpio/tiny/init <<'INIT'
 #!/bin/busybox sh
-# Minimal initramfs /init: mount real root, mount dev/proc/sys in it, switch_root
-
 BB=/bin/busybox
 
 fail() {
@@ -167,31 +165,46 @@ fail() {
   exec $BB sh
 }
 
-# Initramfs basics (enough to read cmdline and mount root)
+# Mount minimal kernel interfaces in initramfs
 $BB mkdir -p /dev /proc /sys /newroot || fail "mkdir"
-$BB mount -t devtmpfs devtmpfs /dev   || fail "mount devtmpfs"
+$BB mount -t devtmpfs devtmpfs /dev   || fail "mount devtmpfs on /dev"
 $BB mount -t proc     proc     /proc  || fail "mount proc"
 $BB mount -t sysfs    sysfs    /sys   || fail "mount sysfs"
 
-# Root device: MUST be a real /dev node (not /dev/disk/by-uuid without udev)
+# Basic console wiring (prevents the noisy "job control" warning in many cases)
+[ -c /dev/console ] || $BB mknod -m 600 /dev/console c 5 1
+[ -c /dev/null ]    || $BB mknod -m 666 /dev/null c 1 3
+exec </dev/console >/dev/console 2>&1
+
+# Parse root= from kernel cmdline
 rootdev="$($BB sed -n 's/.*\<root=\([^ ]*\).*/\1/p' /proc/cmdline)"
 [ -n "$rootdev" ] || fail "missing root= on kernel cmdline"
 
-# Mount real root
-$BB mount -o rw "$rootdev" /newroot || fail "mount root $rootdev"
+# If rootdev is a /dev node, wait briefly for it to appear (async probe)
+case "$rootdev" in
+  /dev/*)
+    i=0
+    while [ ! -e "$rootdev" ] && [ $i -lt 50 ]; do
+      $BB usleep 100000 2>/dev/null || $BB sleep 0.1
+      i=$((i+1))
+    done
+    [ -e "$rootdev" ] || fail "root device node not found: $rootdev"
+    ;;
+esac
 
-# Mount kernel interfaces inside the *real* root (no --move needed)
+# Mount the real root
+$BB mount -o rw "$rootdev" /newroot || fail "mount root ($rootdev) on /newroot"
+
+# Mount dev/proc/sys INSIDE the real root (so /dev contains block devices there)
 $BB mkdir -p /newroot/dev /newroot/proc /newroot/sys || fail "mkdir newroot mounts"
 $BB mount -t devtmpfs devtmpfs /newroot/dev          || fail "mount devtmpfs in newroot"
 $BB mount -t proc     proc     /newroot/proc         || fail "mount proc in newroot"
 $BB mount -t sysfs    sysfs    /newroot/sys          || fail "mount sysfs in newroot"
 
-# Hand off
-if $BB switch_root /newroot /sbin/init; then
-  :
-else
-  exec $BB switch_root /newroot /bin/sh
-fi
+# Hand off to userspace
+exec $BB switch_root /newroot /sbin/init 2>/dev/null || \
+exec $BB switch_root /newroot /bin/sh 2>/dev/null   || \
+exec $BB chroot /newroot /bin/sh
 INIT
     chmod +x /etc/initcpio/tiny/init
 
@@ -254,4 +267,4 @@ options root=${ROOT_PART} rw rootfstype=ext4
 E
 EOF
 
-echo "Reboot."
+echo "Install complete."
